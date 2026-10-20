@@ -44,7 +44,7 @@
 <script>
 // Everything is drawn at GBA resolution from the pret/pokefirered decomp data, then scaled up.
 const PRET = '/pret/'; // proxied and cached by server.js
-const W = 36 * 16, H = 22 * 16; // map area: the largest Silph Co floor; smaller floors sit centered in it
+const W = 30 * 16, H = 25 * 16; // map area: lobby on top, two rooms below (the biggest combination); smaller ones sit centered
 const GUIDE_W = 96, PARTY_W = 160, CW = GUIDE_W + W + PARTY_W; // floor directory | map | party, side by side
 const LOG_H = 136; // activity log strip under all three
 const cv = document.getElementById('screen');
@@ -116,44 +116,59 @@ function blit(buf, dx, dy, set, tile, pal, hf, vf) {
     }
 }
 
-// ---- world: Silph Co. 1F-11F, each project floor gets its own layout ----
-// [layout, width, height, elevator door] in metatiles, from data/layouts and data/maps/*/map.json.
-// Ordered by how office-like they are: projects fill the busy work floors first, the lobby and penthouse last.
-const LAYOUTS = [
-  ['SilphCo_5F', 36, 22, [22, 3]], ['SilphCo_3F', 36, 22, [22, 3]], ['SilphCo_2F', 36, 22, [22, 3]],
-  ['SilphCo_4F', 36, 22, [22, 3]], ['SilphCo_7F', 31, 19, [23, 3]], ['SilphCo_6F', 31, 19, [20, 3]],
-  ['SilphCo_8F', 31, 19, [22, 3]], ['SilphCo_9F', 31, 19, [24, 3]], ['SilphCo_1F', 36, 22, [22, 3]],
-  ['SilphCo_10F', 17, 19, [13, 3]], ['SilphCo_11F', 17, 20, [13, 3]],
+// ---- world: a research lab built from FRLG's lab rooms. Each project floor = the Cinnabar lab lobby
+// with two rooms below it, a different pair per floor; doors in the lobby lead into the rooms. ----
+const MB = { COUNTER: 0x80, BOOKSHELF: 0x81, SHELF: 0x82, PC: 0x83, BLUEPRINTS: 0x93, MACHINE: 0x95, COMPUTER: 0x97, LIGHTS: 0x9e }; // metatile behaviors
+const SPOT = { MEET: 0x1001, TABLE: 0x1002, LOBBY_MEET: 0x1003, DESK: 0x1004 }; // hand-picked spots where no behavior says "table"
+// [layout, width, height, secondary tileset, door mat, extra spots], coordinates from data/layouts and data/maps/*/map.json
+const ROOMS = {
+  lobby:      ['CinnabarIsland_PokemonLab_Entrance', 28, 11, 'lab', [4, 9], [[SPOT.DESK, 16, 7], [SPOT.LOBBY_MEET, 6, 5]]],
+  lounge:     ['CinnabarIsland_PokemonLab_Lounge', 15, 11, 'lab', [7, 9], [[SPOT.MEET, 7, 7]]],
+  research:   ['CinnabarIsland_PokemonLab_ResearchRoom', 15, 11, 'lab', [7, 9], []],
+  experiment: ['CinnabarIsland_PokemonLab_ExperimentRoom', 15, 11, 'lab', [7, 9], []],
+  oak:        ['PalletTown_ProfessorOaksLab', 13, 14, 'lab', [6, 12], [[SPOT.TABLE, 9, 5]]],
+  bill:       ['Route25_SeaCottage', 15, 11, 'sea_cottage', [7, 9], [[SPOT.TABLE, 4, 6]]],
+  island:     ['ThreeIsland_House1', 11, 9, 'lab', [4, 7], [[SPOT.TABLE, 5, 6]]],
+};
+const LOBBY_DOORS = [[13, 5], [19, 5]]; // lead to the left and right room
+const FLOOR_PLANS = [ // two rooms per floor, picked so every floor has machines, computers and shelves
+  ['research', 'experiment'], ['lounge', 'oak'], ['research', 'bill'], ['oak', 'experiment'],
+  ['lounge', 'experiment'], ['island', 'oak'], ['research', 'oak'], ['bill', 'experiment'],
 ];
-const MB = { COUNTER: 0x80, PC: 0x83, BLUEPRINTS: 0x93, PAINTING: 0x94, TELEPHONE: 0x96, COMPUTER: 0x97, LIGHTS: 0x9e }; // metatile behaviors
 const LEVELS = [];
 const levelOf = f => LEVELS[f % LEVELS.length];
 
 async function loadWorld() {
-  // Silph Co borrows its tile graphics and palettes from the Condominiums tileset
-  const P = 'data/tilesets/primary/building/', S = 'data/tilesets/secondary/condominiums/', SM = 'data/tilesets/secondary/silph_co/';
-  const [pT, sT, pM, sM, pA, sA, ...rest] = await Promise.all([
-    png(P + 'tiles.png'), png(S + 'tiles.png'), bytes(P + 'metatiles.bin'), bytes(SM + 'metatiles.bin'),
-    bytes(P + 'metatile_attributes.bin'), bytes(SM + 'metatile_attributes.bin'),
-    ...LAYOUTS.map(([name]) => bytes(`data/layouts/${name}/map.bin`)),
-    ...Array.from({ length: 13 }, (_, i) => jasc((i < 7 ? P : S) + `palettes/${String(i).padStart(2, '0')}.pal`)),
+  const P = 'data/tilesets/primary/building/', pal = (dir, i) => jasc(`${dir}palettes/${String(i).padStart(2, '0')}.pal`);
+  const [pT, pM, pA, ...pPals] = await Promise.all([
+    png(P + 'tiles.png'), bytes(P + 'metatiles.bin'), bytes(P + 'metatile_attributes.bin'), ...[0, 1, 2, 3, 4, 5, 6].map(i => pal(P, i)),
   ]);
-  const pals = rest.slice(LAYOUTS.length);
-  LAYOUTS.forEach(([name, w, h, elevator], i) => LEVELS.push(buildLevel(name, w, h, elevator, rest[i], { pT, sT, pM, sM, pA, sA, pals })));
+  const tilesets = {};
+  for (const sec of new Set(Object.values(ROOMS).map(r => r[3]))) {
+    const S = `data/tilesets/secondary/${sec}/`;
+    const [sT, sM, sA, ...sPals] = await Promise.all([
+      png(S + 'tiles.png'), bytes(S + 'metatiles.bin'), bytes(S + 'metatile_attributes.bin'), ...[7, 8, 9, 10, 11, 12].map(i => pal(S, i)),
+    ]);
+    tilesets[sec] = { pT, pM, pA, sT, sM, sA, pals: [...pPals, ...sPals] };
+  }
+  const parts = {};
+  for (const [key, [name, w, h, sec, door, spots]] of Object.entries(ROOMS))
+    parts[key] = { ...buildPart(w, h, await bytes(`data/layouts/${name}/map.bin`), tilesets[sec]), door, spots };
+  for (const plan of FLOOR_PLANS) LEVELS.push(composeFloor(parts, plan));
 }
 
-function buildLevel(name, w, h, elevator, blocks, { pT, sT, pM, sM, pA, sA, pals }) {
+// One FRLG map -> pixels (ground layer + the layer drawn over sprites) and per-tile collision/behavior.
+function buildPart(w, h, blocks, { pT, sT, pM, sM, pA, sA, pals }) {
   const pw = w * 16, ph = h * 16;
-  const L = { name, w, h, elevator, ox: Math.floor((W - pw) / 32) * 16, oy: Math.floor((H - ph) / 32) * 16,
-              blocked: new Uint8Array(w * h), covered: new Uint8Array(w * h), behavior: new Uint16Array(w * h) };
+  const P = { w, h, blocked: new Uint8Array(w * h), covered: new Uint8Array(w * h), behavior: new Uint16Array(w * h) };
   const lo = new ImageData(pw, ph), hi = new ImageData(pw, ph);
   for (let i = 0; i < pw * ph; i++) lo.data.set([...pals[0][0], 255], i * 4); // GBA backdrop color
   for (let y = 0; y < h; y++)
     for (let x = 0; x < w; x++) {
       const v = u16(blocks, y * w + x), id = v & 0x3ff, sec = id >= 640, k = sec ? id - 640 : id;
       const attr = u32(sec ? sA : pA, k), layer = attr >>> 29 & 3, terrain = attr >>> 9 & 31;
-      L.blocked[y * w + x] = (v >> 10 & 3) !== 0 || terrain === 2 || terrain === 3; // walls + water
-      L.behavior[y * w + x] = attr & 0x1ff;
+      P.blocked[y * w + x] = (v >> 10 & 3) !== 0 || terrain === 2 || terrain === 3; // walls + water
+      P.behavior[y * w + x] = attr & 0x1ff;
       for (let t = 0; t < 8; t++) {
         const e = u16(sec ? sM : pM, k * 8 + t), tile = e & 0x3ff;
         // layer type 1 (covered) keeps both halves under sprites; otherwise the top half goes over them
@@ -165,28 +180,58 @@ function buildLevel(name, w, h, elevator, blocks, { pT, sT, pM, sM, pA, sA, pals
     const bx = (i % w) * 16, by = Math.floor(i / w) * 16;
     let n = 0;
     for (let y = 0; y < 16; y++) for (let x = 0; x < 16; x++) n += hi.data[((by + y) * pw + bx + x) * 4 + 3] > 0;
-    L.covered[i] = n > 96;
+    P.covered[i] = n > 96;
   }
-  L.below = Object.assign(document.createElement('canvas'), { width: pw, height: ph });
-  L.above = Object.assign(document.createElement('canvas'), { width: pw, height: ph });
-  L.below.getContext('2d').putImageData(lo, 0, 0);
-  L.above.getContext('2d').putImageData(hi, 0, 0);
-  L.front = nearest(L, [elevator[0], elevator[1] + 1], () => true);
+  P.below = Object.assign(document.createElement('canvas'), { width: pw, height: ph });
+  P.above = Object.assign(document.createElement('canvas'), { width: pw, height: ph });
+  P.below.getContext('2d').putImageData(lo, 0, 0);
+  P.above.getContext('2d').putImageData(hi, 0, 0);
+  return P;
+}
+
+// Lobby centred on top, the two rooms side by side under it; lobby doors link to each room's door mat.
+function composeFloor(parts, [left, right]) {
+  const lobby = parts.lobby, a = parts[left], b = parts[right];
+  const w = Math.max(lobby.w, a.w + b.w), h = lobby.h + Math.max(a.h, b.h);
+  const L = { name: `${left}+${right}`, w, h, ox: Math.floor((W - w * 16) / 32) * 16, oy: Math.floor((H - h * 16) / 32) * 16,
+              blocked: new Uint8Array(w * h).fill(1), covered: new Uint8Array(w * h), behavior: new Uint16Array(w * h),
+              links: new Map(), spots: [] };
+  L.below = Object.assign(document.createElement('canvas'), { width: w * 16, height: h * 16 });
+  L.above = Object.assign(document.createElement('canvas'), { width: w * 16, height: h * 16 });
+  const lo = L.below.getContext('2d'), hi = L.above.getContext('2d');
+  lo.fillStyle = '#000'; lo.fillRect(0, 0, w * 16, h * 16);
+  const at = { lobby: [Math.floor((w - lobby.w) / 2), 0] }, x0 = Math.floor((w - a.w - b.w) / 2);
+  at.a = [x0, lobby.h]; at.b = [x0 + a.w, lobby.h];
+  for (const [k, P] of [['lobby', lobby], ['a', a], ['b', b]]) {
+    const [ox, oy] = at[k];
+    lo.drawImage(P.below, ox * 16, oy * 16); hi.drawImage(P.above, ox * 16, oy * 16);
+    for (let y = 0; y < P.h; y++)
+      for (let x = 0; x < P.w; x++) {
+        const i = (oy + y) * w + ox + x, j = y * P.w + x;
+        L.blocked[i] = P.blocked[j]; L.covered[i] = P.covered[j]; L.behavior[i] = P.behavior[j];
+      }
+    for (const [kind, sx, sy] of P.spots) L.spots.push({ b: kind, at: [ox + sx, oy + sy] });
+  }
+  const link = (p, q) => { L.links.set(p.join(), q); L.links.set(q.join(), p); };
+  const off = ([x, y], [ox, oy]) => [x + ox, y + oy];
+  link(off(LOBBY_DOORS[0], at.lobby), off(a.door, at.a));
+  link(off(LOBBY_DOORS[1], at.lobby), off(b.door, at.b));
+  L.entrance = off(lobby.door, at.lobby); // the lobby's front door mat: everyone arrives and the trainer starts here
+  L.front = nearest(L, [L.entrance[0], L.entrance[1] - 1], () => true);
   assignZones(L);
   return L;
 }
 
-// Rooms come from the equipment each floor really has, picked as far apart as possible.
-// Only spots you can walk to from the elevator count: some Silph areas are reachable only by teleport pads.
+// Rooms come from the equipment the floor really has (bookshelves, computers, machines), spread apart.
 const ZONE_PREFS = [
-  ['server',  [MB.LIGHTS, MB.COMPUTER, MB.PAINTING]],
-  ['dev',     [MB.COMPUTER, MB.PC, MB.LIGHTS, MB.PAINTING]],
-  ['search',  [MB.LIGHTS, MB.COMPUTER, MB.PC, MB.PAINTING]],
-  ['meeting', [MB.BLUEPRINTS, MB.COUNTER, MB.TELEPHONE, MB.PAINTING]],
-  ['archive', [MB.BLUEPRINTS, MB.COUNTER, MB.TELEPHONE, MB.COMPUTER, MB.LIGHTS, MB.PAINTING]],
-  ['desk',    [MB.TELEPHONE, MB.COUNTER, MB.COMPUTER, MB.LIGHTS, MB.PAINTING]],
+  ['server',  [MB.MACHINE, MB.LIGHTS, MB.COMPUTER]],
+  ['dev',     [MB.COMPUTER, MB.PC]],
+  ['search',  [MB.LIGHTS, MB.COMPUTER, MB.PC, MB.MACHINE]],
+  ['archive', [MB.BOOKSHELF, MB.SHELF, MB.BLUEPRINTS, MB.COUNTER]],
+  ['meeting', [SPOT.MEET, SPOT.TABLE, SPOT.LOBBY_MEET, MB.BLUEPRINTS, MB.COUNTER]], // the lounge's big table first
+  ['desk',    [SPOT.DESK]],
 ];
-const ZONE_GAP = 6; // tiles between rooms, so they don't pile up around one counter
+const ZONE_GAP = 4; // tiles between rooms (hand-picked spots don't need it)
 function nearest(L, [x0, y0], ok) { // closest standable tile by distance, walls or not in between
   for (let r = 0; r < Math.max(L.w, L.h); r++)
     for (let dy = -r; dy <= r; dy++)
@@ -200,10 +245,10 @@ function assignZones(L) {
   reach.add(L.front.join());
   while (q.length) {
     const [x, y] = q.shift();
-    for (const [dx, dy] of [[0, 1], [1, 0], [0, -1], [-1, 0]])
-      if (walkable(L, x + dx, y + dy) && !reach.has(`${x + dx},${y + dy}`)) { reach.add(`${x + dx},${y + dy}`); q.push([x + dx, y + dy]); }
+    for (const n of steps(L, x, y))
+      if (!reach.has(n.join())) { reach.add(n.join()); q.push(n); }
   }
-  const clusters = [], seen = new Set(), kinds = Object.values(MB);
+  const clusters = L.spots.map(s => ({ ...s, tiles: [] })), seen = new Set(), kinds = Object.values(MB);
   for (let i = 0; i < L.w * L.h; i++) {
     const b = L.behavior[i];
     if (!kinds.includes(b) || seen.has(i)) continue;
@@ -225,9 +270,12 @@ function assignZones(L) {
   L.zones = {};
   for (const [zone, prefs] of ZONE_PREFS) {
     let pick;
-    for (const b of prefs) {
-      const c = clusters.filter(c => c.b === b && !used.has(c) && (!pts.length || spread(c.at) >= ZONE_GAP));
-      if (c.length) { pick = c.sort((p, q) => spread(q.at) - spread(p.at) || q.tiles.length - p.tiles.length)[0]; break; }
+    for (const gap of [ZONE_GAP, 1]) { // spread rooms out if the floor allows; otherwise share a corner rather than go without
+      for (const b of prefs) {
+        const c = clusters.filter(c => c.b === b && !used.has(c) && (b >= 0x1000 || !pts.length || spread(c.at) >= gap));
+        if (c.length) { pick = c.sort((p, q) => spread(q.at) - spread(p.at) || q.tiles.length - p.tiles.length)[0]; break; }
+      }
+      if (pick) break;
     }
     if (pick) used.add(pick);
     const at = pick ? pick.at : [...reach].map(k => k.split(',').map(Number)).sort((a, b) => spread(b) - spread(a))[0];
@@ -438,7 +486,11 @@ const mons = new Map();
 let live = false;
 const tileOf = m => [Math.floor(m.x / 16), Math.floor(m.y / 16)];
 const walkable = (L, x, y) => x >= 0 && y >= 0 && x < L.w && y < L.h && !L.blocked[y * L.w + x];
-const standable = (L, x, y) => walkable(L, x, y) && !L.covered[y * L.w + x];
+const standable = (L, x, y) => walkable(L, x, y) && !L.covered[y * L.w + x] && !L.links.has(`${x},${y}`); // never idle in a doorway
+// Where you can get to in one move: the four neighbours, plus the other side when standing in a doorway.
+const steps = (L, x, y) => [[x, y + 1], [x + 1, y], [x, y - 1], [x - 1, y]].filter(n => walkable(L, ...n))
+  .concat(L.links.has(`${x},${y}`) ? [L.links.get(`${x},${y}`)] : []);
+const onFloor = f => [...mons.values()].filter(m => m.floor === f && !m.leaving);
 
 function bfs(L, from, done) { // 4-way flood over walkable tiles; returns path to the first tile where done() is true
   const prev = new Map([[from.join(), null]]), q = [from];
@@ -449,10 +501,8 @@ function bfs(L, from, done) { // 4-way flood over walkable tiles; returns path t
       for (let k = cur; k; k = prev.get(k.join())) path.unshift(k);
       return path;
     }
-    for (const [dx, dy] of [[0, 1], [1, 0], [0, -1], [-1, 0]]) {
-      const n = [cur[0] + dx, cur[1] + dy];
-      if (walkable(L, ...n) && !prev.has(n.join())) { prev.set(n.join(), cur); q.push(n); }
-    }
+    for (const n of steps(L, ...cur))
+      if (!prev.has(n.join())) { prev.set(n.join(), cur); q.push(n); }
   }
   return [from];
 }
@@ -496,8 +546,8 @@ function setLevel(m, lv) { // silent, for work done before we started watching
   setForm(m, st);
 }
 function spawn(key, chain, label, parent, floor) {
-  const [ex, ey] = levelOf(floor).elevator;
-  const m = { key, chain, label, parent, floor, x: ex * 16 + 8, y: ey * 16 + 15, path: [], dir: 'down',
+  const [ex, ey] = levelOf(floor).entrance;
+  const m = { key, chain, label, parent, floor, x: ex * 16 + 8, y: ey * 16 + 15, path: [], dir: 'up', warpAt: performance.now(),
               emote: '', status: '', lv: START_LV, doing: '', appearAt: 0 };
   setForm(m, 0);
   mons.set(key, m);
@@ -530,13 +580,13 @@ function session(ev) {
     const chain = CHAINS.map((_, i) => CHAINS[(h + i) % CHAINS.length]).find(c => !used.has(c)) || CHAINS[h % CHAINS.length];
     m = spawn(ev.session, chain, baseName(ev.cwd), null, floorOf(ev.cwd));
     place(m, 'desk');
-    say(m, `${m.name}${josa(m.name, '이', '가')} 엘리베이터를 타고 출근했다!`);
-    logAct(m, '엘리베이터', `출근 (${m.label})`, 'in');
+    say(m, `${m.name}${josa(m.name, '이', '가')} 연구소에 출근했다!`);
+    logAct(m, '현관', `출근 (${m.label})`, 'in');
   }
   return m;
 }
 
-// Subagents: called by phone from the desk, arrive by elevator a moment later.
+// Subagents: called by phone from the desk, come in through the front door a moment later.
 function spawnChild(p, key, agentType, delay) {
   const used = new Set([...mons.values()].map(o => o.chain)), h = hash(key);
   const chain = AGENT_CHAINS[agentType] ||
@@ -633,8 +683,8 @@ function apply(ev) {
         const c = spawnChild(m, ev.toolId, ev.agentType, 1800);
         c.task = c.doing = ev.detail || '';
         logAct(m, '내 자리', `전화로 ${c.name} 호출 (${ev.agentType || 'agent'})`, 'call');
-        logAct(c, '엘리베이터', `출근 · ${c.task || '지원 업무'}`, 'in');
-        say(m, `${N}${josa(N, '이', '가')} 전화로 지원을 요청했다!\n${c.name}${josa(c.name, '이', '가')} 엘리베이터를 타고 출근했다!`);
+        logAct(c, '현관', `출근 · ${c.task || '지원 업무'}`, 'in');
+        say(m, `${N}${josa(N, '이', '가')} 전화로 지원을 요청했다!\n${c.name}${josa(c.name, '이', '가')} 현관으로 들어왔다!`);
       } else if (ev.tool === 'AskUserQuestion') {
         place(m, 'desk'); m.emote = '!'; m.status = 'PAR'; m.doing = '내 자리 · 트레이너를 기다리는 중';
         bubble(m, ev.detail || '여쭤볼 게 있어요!', 'talk', 6000);
@@ -729,9 +779,16 @@ function drawAnim(a, x, y, row, t, tint, scale = 1) {
   ctx.drawImage(scratch, Math.round(x - w / 2), Math.round(y - h / 2), w, h);
 }
 
+// Go through a door: gone from one side, fading in on the other.
+function warp(m, [x, y]) {
+  m.warpFrom = [m.x, m.y]; m.warpAt = performance.now(); m.lastPad = `${x},${y}`;
+  m.x = x * 16 + 8; m.y = y * 16 + 15;
+}
 function step(m, dt) {
   let budget = dt * 0.0625 * (m.speed || 1); // FRLG walking speed: 1 tile per 16 frames
   while (budget > 0 && m.path.length) {
+    const [cx, cy] = tileOf(m), [nx, ny] = m.path[0];
+    if (Math.abs(nx - cx) + Math.abs(ny - cy) > 1 && m.x === cx * 16 + 8 && m.y === cy * 16 + 15) { warp(m, m.path.shift()); continue; }
     const tx = m.path[0][0] * 16 + 8, ty = m.path[0][1] * 16 + 15, dx = tx - m.x, dy = ty - m.y, d = Math.hypot(dx, dy);
     if (d > 0.01) m.dir = Math.abs(dx) > Math.abs(dy) ? (dx > 0 ? 'right' : 'left') : (dy > 0 ? 'down' : 'up');
     if (d <= budget) { m.x = tx; m.y = ty; m.path.shift(); budget -= d; }
@@ -765,12 +822,15 @@ function drawMon(m, t) {
   }
   const sh = sheet(m.evo?.t === null ? m.evo.from : m.dex), moving = m.path.length > 0;
   const a = m.status === 'SLP' && !moving ? (sh.Sleep || sh.Idle) : moving ? sh.Walk : (sh.Idle || sh.Walk);
+  ctx.globalAlpha = doorFade(m, t);
   ctx.drawImage(UI.shadow, x - 8, y - 6);
   if (a?.img.complete && a.img.naturalWidth) {
     drawAnim(a, m.x, m.y - 6, DIR[m.dir], t + hash(m.key) % 1000);
     m.top = Math.round(m.y - 6 - a.h / 2 + 6);
   }
+  ctx.globalAlpha = 1;
 }
+const doorFade = (m, t) => Math.min(1, Math.max(0.05, (t - (m.warpAt || -1e9)) / 300)); // just came through a door
 
 // Emote, cold sweat and speech bubble go above everything, including roofs and wall tops.
 let bubbleRects = []; // bubbles drawn this frame
@@ -1054,7 +1114,7 @@ function talk() {
   say(m, `${m.name}: ${line}`, { force: true });
 }
 
-// You sent a message: walk over to that session's pokémon (taking the elevator if needed) and tell it.
+// You sent a message: walk over to that session's pokémon (riding up to its floor if needed) and tell it.
 function visit(m, msg) {
   trainer.visit = { key: m.key, msg, started: false };
   if (m.floor !== floor) startLift(m.floor);
@@ -1075,10 +1135,18 @@ function tickVisit() {
     trainer.visit = null;
   }
 }
+function padHop() { // walked into a doorway with the arrow keys: out the other side
+  const L = levelOf(floor), k = tileOf(trainer).join();
+  if (!L.links.has(k)) { trainer.lastPad = null; return; }
+  if (trainer.path.length || trainer.lastPad === k) return;
+  warp(trainer, L.links.get(k));
+}
 function drawTrainer(t) {
   const walk = { down: [3, 0, 4, 0], up: [5, 1, 6, 1], left: [7, 2, 8, 2], right: [7, 2, 8, 2] }[trainer.dir];
   const n = trainer.path.length ? walk[Math.floor(t / (133 / trainer.speed)) % 4] : walk[1];
+  ctx.globalAlpha = doorFade(trainer, t);
   ctx.drawImage((trainer.dir === 'right' ? UI.redEast : UI.red)[n], Math.round(trainer.x) - 8, Math.round(trainer.y) - 31);
+  ctx.globalAlpha = 1;
 }
 
 let last = 0;
@@ -1094,6 +1162,7 @@ function frame(t) {
   tickVisit();
   steerTrainer();
   step(trainer, dt);
+  padHop();
 
   const L = levelOf(floor);
   ctx.save();
