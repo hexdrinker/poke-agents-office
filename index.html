@@ -466,9 +466,20 @@ const freeNear = (m, at, not = () => false) => {
 function go(m, goal) {
   m.goal = goal;
   m.path = bfs(levelOf(m.floor), tileOf(m), (x, y) => x === goal[0] && y === goal[1]).slice(1);
-  m.speed = m.path.length > 10 ? 2 : 1; // run across the floor, walk within a room
+  m.speed = m.plan?.length >= 2 ? 2.5 : 1.25; // a bit brisker than the games; run to catch up on a backlog
 }
+// Tool calls come faster than anyone can walk, so rooms are visited in order instead of
+// re-routing mid-step: finish the walk, then go on. Only the latest few are kept.
+const MAX_PLAN = 3;
 function place(m, zone) {
+  m.plan ??= [];
+  if (zone === (m.plan.length ? m.plan[m.plan.length - 1] : m.zone)) return; // already going there
+  m.plan.push(zone);
+  if (m.plan.length > MAX_PLAN) m.plan.splice(0, m.plan.length - MAX_PLAN);
+}
+function tickPlan(m, t) {
+  if (!m.plan?.length || m.path.length || m.leaving || m.reporting) return;
+  const zone = m.plan.shift();
   m.zone = zone;
   go(m, zone === 'desk' ? m.home : freeNear(m, levelOf(m.floor).zones[zone].at));
 }
@@ -509,7 +520,7 @@ function levelUp(m) {
 const RECALL_MS = 1300;
 function leave(m, animate = live) {
   if (!m || m.leaving) return;
-  Object.assign(m, { leaving: true, goal: null, path: [], running: null, recallAt: animate ? performance.now() : -1e9 });
+  Object.assign(m, { leaving: true, goal: null, path: [], plan: [], running: null, recallAt: animate ? performance.now() : -1e9 });
 }
 
 function session(ev) {
@@ -539,13 +550,17 @@ function spawnChild(p, key, agentType, delay) {
 function report(c) {
   if (!c || c.reporting || c.leaving) return;
   if (!live) return leave(c);
-  c.reporting = true;
-  const p = mons.get(c.parent), at = p?.goal || (p ? tileOf(p) : c.home);
-  go(c, freeNear(c, at, (x, y) => x === at[0] && y === at[1]));
+  c.reporting = true; c.plan = []; // tickReports walks it over once its current step is done
 }
 function tickReports(t) {
   for (const c of mons.values()) {
     if (!c.reporting || c.leaving || c.path.length) continue;
+    if (!c.reportWalk) { // finished whatever walk it was on: now head to whoever called
+      c.reportWalk = true;
+      const p = mons.get(c.parent), at = p?.goal || (p ? tileOf(p) : c.home);
+      go(c, freeNear(c, at, (x, y) => x === at[0] && y === at[1]));
+      continue;
+    }
     evT = Date.now();
     if (!c.reportT) {
       c.reportT = t; bubble(c, '보고드립니다!', 'talk', 1800, true);
@@ -571,7 +586,7 @@ let evT = Date.now(); // time of the event being handled
 const whereOf = m => ZONE_NAMES[m.zone] || '내 자리';
 let logScroll = 0, logUnread = 0; // lines scrolled up from the newest; 0 = follow new entries
 function logAct(m, where, what, kind = '') {
-  activity.push({ t: evT, floor: m.floor, who: m.name, where, what, kind });
+  activity.push({ t: evT, floor: m.floor, who: m.name, key: m.key, where, what, kind });
   activity.sort((a, b) => a.t - b.t); // transcripts replay one after another, so keep it in time order
   if (activity.length > 2000) activity.shift();
   if (logScroll > 0) { logScroll++; logUnread++; } // reading older lines: keep the view still
@@ -858,8 +873,10 @@ function drawLog() {
   logScroll = Math.max(0, Math.min(logScroll, activity.length - LOG_ROWS));
   if (!logScroll) logUnread = 0;
   const start = Math.max(0, activity.length - LOG_ROWS - logScroll);
+  logRows = [];
   activity.slice(start, start + LOG_ROWS).forEach((a, i) => { // oldest on top, newest at the bottom
     const y = 21 + i * 13;
+    logRows.push({ y: H + y, key: a.key });
     text(ctx, new Date(a.t).toTimeString().slice(0, 8), 10, y, FONT_S);
     text(ctx, `${a.floor + 1}F`, 64, y, FONT_S);
     text(ctx, fit(a.who, 60, FONT_S), 86, y, FONT_S);
@@ -880,7 +897,7 @@ function drawLog() {
     logJump = [x, H + y, w, 13];
   } else logJump = null;
 }
-let logJump = null; // clickable "jump to newest" area, in canvas coords
+let logJump = null, logRows = []; // clickable "jump to newest" area and log rows, in canvas coords
 cv.addEventListener('wheel', e => {
   const r = cv.getBoundingClientRect();
   if ((e.clientY - r.top) * cv.height / r.height < H) return; // only the log scrolls
@@ -904,19 +921,28 @@ function drawGuide(t) {
   }
   ['방향키  이동', 'Shift  달리기', 'Z  말 걸기'].forEach((l, i) => text(ctx, l, 10, H - 54 + i * 14, FONT_S));
 }
-cv.addEventListener('click', e => {
+// What's under the pointer: a pokémon (map, party slot or log row), a floor, or the jump-to-newest button.
+function hitAt(e) {
   const r = cv.getBoundingClientRect(), x = (e.clientX - r.left) * CW / r.width, y = (e.clientY - r.top) * cv.height / r.height;
-  if (logJump && x >= logJump[0] && x < logJump[0] + logJump[2] && y >= logJump[1] && y < logJump[1] + logJump[3]) { logScroll = 0; return; }
-  if (y >= H) return;
-  if (x >= GUIDE_W + W) { const m = partyList(performance.now())[Math.floor((y - 3) / 34)]; if (m) openChat(m); return; }
-  if (x >= GUIDE_W) { // a pokémon on the map
+  if (logJump && x >= logJump[0] && x < logJump[0] + logJump[2] && y >= logJump[1] && y < logJump[1] + logJump[3]) return { jump: true };
+  if (y >= H) { const row = logRows.find(l => y >= l.y && y < l.y + 13); return { mon: row && mons.get(row.key) }; }
+  if (x >= GUIDE_W + W) return { mon: partyList(performance.now())[Math.floor((y - 3) / 34)] };
+  if (x >= GUIDE_W) { // generous box around the sprite; nearest one wins
     const L = levelOf(floor), mx = x - GUIDE_W - L.ox, my = y - L.oy;
-    const m = onFloor(floor).filter(m => Math.abs(m.x - mx) < 12 && my > (m.top ?? m.y - 24) - 2 && my < m.y + 3).sort((a, b) => b.y - a.y)[0];
-    if (m) openChat(m);
-    return;
+    const near = onFloor(floor).filter(m => Math.abs(m.x - mx) < 16 && my > (m.top ?? m.y - 24) - 6 && my < m.y + 6);
+    return { mon: near.sort((a, b) => Math.hypot(a.x - mx, a.y - 12 - my) - Math.hypot(b.x - mx, b.y - 12 - my))[0] };
   }
-  const row = guideRows.find(g => y >= g.y - 2 && y < g.y + 16);
-  if (row) startLift(row.i);
+  return { floor: guideRows.find(g => y >= g.y - 2 && y < g.y + 16)?.i };
+}
+cv.addEventListener('click', e => {
+  const h = hitAt(e);
+  if (h.jump) logScroll = 0;
+  else if (h.mon) openChat(h.mon);
+  else if (h.floor != null) startLift(h.floor);
+});
+cv.addEventListener('mousemove', e => {
+  const h = hitAt(e);
+  cv.style.cursor = h.jump || h.mon || h.floor != null ? 'pointer' : '';
 });
 
 // ---- conversation panel: click a pokémon (map or party) to read its session ----
@@ -1060,6 +1086,7 @@ function frame(t) {
   const dt = Math.min(50, t - last); last = t;
   for (const m of [...mons.values()]) {
     if (t < m.appearAt) continue;
+    tickPlan(m, t);
     step(m, dt);
     if (m.recallAt != null && t - m.recallAt > RECALL_MS) mons.delete(m.key);
   }
