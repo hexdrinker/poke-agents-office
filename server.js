@@ -159,6 +159,46 @@ function scan() {
   firstPoll = false;
 }
 
+// ---- conversation for the side panel: parsed on demand, cached until the file grows ----
+const chats = new Map(); // file -> { size, data }
+function chat(file, sub) {
+  const size = fs.statSync(file).size, hit = chats.get(file);
+  if (hit?.size === size) return hit.data;
+  const items = [], byId = new Map();
+  let turns = 0, tools = 0;
+  for (const line of fs.readFileSync(file, 'utf8').split('\n')) {
+    let r;
+    try { r = JSON.parse(line); } catch { continue; }
+    const c = r.message?.content, t = r.timestamp;
+    if (r.type === 'assistant' && Array.isArray(c)) {
+      for (const b of c) {
+        if (b.type === 'text' && b.text?.trim()) items.push({ role: 'assistant', text: b.text, t });
+        if (b.type === 'tool_use') {
+          tools++;
+          const it = { role: 'tool', id: b.id, tool: b.name, text: short(detailOf(b.name, b.input), 160) ?? '', t };
+          byId.set(b.id, it); items.push(it);
+        }
+      }
+    } else if (r.type === 'user' && !r.isMeta) {
+      for (const b of typeof c === 'string' ? [{ type: 'text', text: c }] : Array.isArray(c) ? c : []) {
+        if (b.type === 'tool_result' && b.is_error === true && byId.has(b.tool_use_id)) byId.get(b.tool_use_id).error = true;
+        else if (b.type === 'text' && b.text && !b.text.trimStart().startsWith('<')) {
+          items.push({ role: sub && !turns ? 'task' : 'user', text: b.text, t }); // a subagent's first message is its task
+          turns++;
+        }
+      }
+    }
+  }
+  const data = { turns, tools, items: items.slice(-400) };
+  chats.set(file, { size, data });
+  return data;
+}
+function chatFor(q) {
+  const agent = q.get('agent'), seat = q.get('seat');
+  for (const [file, f] of files) if (agent && f.sub?.toolUseId === agent) return chat(file, true);
+  const s = seats.get(seat), file = s && findTranscript(s.sessionId);
+  return file && { ...chat(file, false), sessionId: s.sessionId, cwd: s.cwd };
+}
 
 async function cached(rel, source) {
   const file = path.join(CACHE, rel);
@@ -181,7 +221,14 @@ poll();
 http.createServer((req, res) => {
   // DNS-rebinding guard: only answer requests addressed to localhost.
   if (!HOSTS.has(req.headers.host)) { res.statusCode = 403; return res.end(); }
-  const url = req.url.split('?')[0];
+  const [url, query] = req.url.split('?');
+
+  if (url === '/api/chat') {
+    let data;
+    try { data = chatFor(new URLSearchParams(query)); } catch {}
+    res.writeHead(data ? 200 : 404, { 'Content-Type': 'application/json; charset=utf-8' });
+    return res.end(JSON.stringify(data || {}));
+  }
 
   if (url === '/events') {
     res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache' });
