@@ -1,0 +1,1005 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Poke Agents Office</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/galmuri@2.40.3/dist/galmuri.css">
+<style>
+  html, body { margin: 0; min-height: 100%; background: #000; }
+  canvas { display: block; margin: 16px auto; image-rendering: pixelated; }
+</style>
+</head>
+<body>
+<canvas id="screen"></canvas>
+<script>
+// Everything is drawn at GBA resolution from the pret/pokefirered decomp data, then scaled up.
+const PRET = 'https://raw.githubusercontent.com/pret/pokefirered/master/';
+const W = 36 * 16, H = 22 * 16; // map area: the largest Silph Co floor; smaller floors sit centered in it
+const GUIDE_W = 96, PARTY_W = 160, CW = GUIDE_W + W + PARTY_W; // floor directory | map | party, side by side
+const LOG_H = 136; // activity log strip under all three
+const cv = document.getElementById('screen');
+cv.width = CW; cv.height = H + LOG_H;
+// Pixel art is crispest at whole-number zoom: snap to 2x, 3x… when the window allows, otherwise just fill it.
+function fitCanvas() {
+  const fit = Math.min((innerWidth - 32) / cv.width, (innerHeight - 32) / cv.height);
+  cv.style.width = `${cv.width * (fit >= 2 ? Math.floor(fit) : fit)}px`;
+}
+addEventListener('resize', fitCanvas);
+fitCanvas();
+const ctx = cv.getContext('2d');
+
+// ---- pret asset decoding ----
+const get = p => fetch(PRET + p).then(r => { if (!r.ok) throw new Error(p); return r; });
+const bytes = async p => new Uint8Array(await (await get(p)).arrayBuffer());
+const jasc = async p => (await (await get(p)).text()).trim().split(/\r?\n/).slice(3).map(l => l.trim().split(/\s+/).map(Number));
+const u16 = (a, i) => a[i * 2] | a[i * 2 + 1] << 8;
+const u32 = (a, i) => (a[i * 4] | a[i * 4 + 1] << 8 | a[i * 4 + 2] << 16 | a[i * 4 + 3] << 24) >>> 0;
+const paeth = (a, b, c) => { const p = a + b - c, pa = Math.abs(p - a), pb = Math.abs(p - b), pc = Math.abs(p - c); return pa <= pb && pa <= pc ? a : pb <= pc ? b : c; };
+
+// Indexed PNG -> { w, h, px: palette indices, plte }. Canvas can't give us indices, so decode by hand.
+async function png(p) {
+  const b = await bytes(p), dv = new DataView(b.buffer);
+  let o = 8, w, h, depth, plte = [], idat = [];
+  while (o < b.length) {
+    const len = dv.getUint32(o), type = String.fromCharCode(...b.subarray(o + 4, o + 8)), d = b.subarray(o + 8, o + 8 + len);
+    if (type === 'IHDR') { w = dv.getUint32(o + 8); h = dv.getUint32(o + 12); depth = d[8]; }
+    else if (type === 'PLTE') for (let i = 0; i < len; i += 3) plte.push([d[i], d[i + 1], d[i + 2]]);
+    else if (type === 'IDAT') idat.push(d);
+    o += 12 + len;
+  }
+  const raw = new Uint8Array(await new Response(new Blob(idat).stream().pipeThrough(new DecompressionStream('deflate'))).arrayBuffer());
+  const stride = Math.ceil(w * depth / 8), px = new Uint8Array(w * h);
+  let prev = new Uint8Array(stride);
+  for (let y = 0; y < h; y++) {
+    const f = raw[y * (stride + 1)], src = raw.subarray(y * (stride + 1) + 1), cur = new Uint8Array(stride);
+    for (let i = 0; i < stride; i++) {
+      const a = i ? cur[i - 1] : 0, u = prev[i], c = i ? prev[i - 1] : 0;
+      cur[i] = src[i] + (f === 1 ? a : f === 2 ? u : f === 3 ? (a + u) >> 1 : f === 4 ? paeth(a, u, c) : 0);
+    }
+    for (let x = 0; x < w; x++) px[y * w + x] = depth === 8 ? cur[x] : (cur[x >> 1] >> (x & 1 ? 0 : 4)) & 15;
+    prev = cur;
+  }
+  return { w, h, px, plte };
+}
+
+// Cut a region of an indexed image into a canvas; palette index 0 is transparent, like on the GBA.
+function cut(img, pal = img.plte, sx = 0, sy = 0, w = img.w, h = img.h, hf = false, vf = false) {
+  const c = document.createElement('canvas'), id = new ImageData(w, h);
+  c.width = w; c.height = h;
+  for (let y = 0; y < h; y++)
+    for (let x = 0; x < w; x++) {
+      const i = img.px[(sy + (vf ? h - 1 - y : y)) * img.w + sx + (hf ? w - 1 - x : x)];
+      if (!i) continue;
+      id.data.set([...pal[i], 255], (y * w + x) * 4);
+    }
+  c.getContext('2d').putImageData(id, 0, 0);
+  return c;
+}
+
+function blit(buf, dx, dy, set, tile, pal, hf, vf) {
+  const tpr = set.w / 8, sx = (tile % tpr) * 8, sy = Math.floor(tile / tpr) * 8;
+  if (sy >= set.h) return;
+  for (let y = 0; y < 8; y++)
+    for (let x = 0; x < 8; x++) {
+      const i = set.px[(sy + (vf ? 7 - y : y)) * set.w + sx + (hf ? 7 - x : x)];
+      if (i) buf.data.set([...pal[i], 255], ((dy + y) * buf.width + dx + x) * 4);
+    }
+}
+
+// ---- world: Silph Co. 1F-11F, each project floor gets its own layout ----
+// [layout, width, height, elevator door] in metatiles, from data/layouts and data/maps/*/map.json.
+// Ordered by how office-like they are: projects fill the busy work floors first, the lobby and penthouse last.
+const LAYOUTS = [
+  ['SilphCo_5F', 36, 22, [22, 3]], ['SilphCo_3F', 36, 22, [22, 3]], ['SilphCo_2F', 36, 22, [22, 3]],
+  ['SilphCo_4F', 36, 22, [22, 3]], ['SilphCo_7F', 31, 19, [23, 3]], ['SilphCo_6F', 31, 19, [20, 3]],
+  ['SilphCo_8F', 31, 19, [22, 3]], ['SilphCo_9F', 31, 19, [24, 3]], ['SilphCo_1F', 36, 22, [22, 3]],
+  ['SilphCo_10F', 17, 19, [13, 3]], ['SilphCo_11F', 17, 20, [13, 3]],
+];
+const MB = { COUNTER: 0x80, PC: 0x83, BLUEPRINTS: 0x93, PAINTING: 0x94, TELEPHONE: 0x96, COMPUTER: 0x97, LIGHTS: 0x9e }; // metatile behaviors
+const LEVELS = [];
+const levelOf = f => LEVELS[f % LEVELS.length];
+
+async function loadWorld() {
+  // Silph Co borrows its tile graphics and palettes from the Condominiums tileset
+  const P = 'data/tilesets/primary/building/', S = 'data/tilesets/secondary/condominiums/', SM = 'data/tilesets/secondary/silph_co/';
+  const [pT, sT, pM, sM, pA, sA, ...rest] = await Promise.all([
+    png(P + 'tiles.png'), png(S + 'tiles.png'), bytes(P + 'metatiles.bin'), bytes(SM + 'metatiles.bin'),
+    bytes(P + 'metatile_attributes.bin'), bytes(SM + 'metatile_attributes.bin'),
+    ...LAYOUTS.map(([name]) => bytes(`data/layouts/${name}/map.bin`)),
+    ...Array.from({ length: 13 }, (_, i) => jasc((i < 7 ? P : S) + `palettes/${String(i).padStart(2, '0')}.pal`)),
+  ]);
+  const pals = rest.slice(LAYOUTS.length);
+  LAYOUTS.forEach(([name, w, h, elevator], i) => LEVELS.push(buildLevel(name, w, h, elevator, rest[i], { pT, sT, pM, sM, pA, sA, pals })));
+}
+
+function buildLevel(name, w, h, elevator, blocks, { pT, sT, pM, sM, pA, sA, pals }) {
+  const pw = w * 16, ph = h * 16;
+  const L = { name, w, h, elevator, ox: Math.floor((W - pw) / 32) * 16, oy: Math.floor((H - ph) / 32) * 16,
+              blocked: new Uint8Array(w * h), covered: new Uint8Array(w * h), behavior: new Uint16Array(w * h) };
+  const lo = new ImageData(pw, ph), hi = new ImageData(pw, ph);
+  for (let i = 0; i < pw * ph; i++) lo.data.set([...pals[0][0], 255], i * 4); // GBA backdrop color
+  for (let y = 0; y < h; y++)
+    for (let x = 0; x < w; x++) {
+      const v = u16(blocks, y * w + x), id = v & 0x3ff, sec = id >= 640, k = sec ? id - 640 : id;
+      const attr = u32(sec ? sA : pA, k), layer = attr >>> 29 & 3, terrain = attr >>> 9 & 31;
+      L.blocked[y * w + x] = (v >> 10 & 3) !== 0 || terrain === 2 || terrain === 3; // walls + water
+      L.behavior[y * w + x] = attr & 0x1ff;
+      for (let t = 0; t < 8; t++) {
+        const e = u16(sec ? sM : pM, k * 8 + t), tile = e & 0x3ff;
+        // layer type 1 (covered) keeps both halves under sprites; otherwise the top half goes over them
+        blit(t < 4 || layer === 1 ? lo : hi, x * 16 + (t & 1) * 8, y * 16 + (t >> 1 & 1) * 8,
+             tile < 640 ? pT : sT, tile < 640 ? tile : tile - 640, pals[e >> 12] || pals[0], e & 0x400, e & 0x800);
+      }
+    }
+  for (let i = 0; i < w * h; i++) { // walkable, but mostly hidden under the top layer: fine to pass, bad to stop on
+    const bx = (i % w) * 16, by = Math.floor(i / w) * 16;
+    let n = 0;
+    for (let y = 0; y < 16; y++) for (let x = 0; x < 16; x++) n += hi.data[((by + y) * pw + bx + x) * 4 + 3] > 0;
+    L.covered[i] = n > 96;
+  }
+  L.below = Object.assign(document.createElement('canvas'), { width: pw, height: ph });
+  L.above = Object.assign(document.createElement('canvas'), { width: pw, height: ph });
+  L.below.getContext('2d').putImageData(lo, 0, 0);
+  L.above.getContext('2d').putImageData(hi, 0, 0);
+  L.front = nearest(L, [elevator[0], elevator[1] + 1], () => true);
+  assignZones(L);
+  return L;
+}
+
+// Rooms come from the equipment each floor really has, picked as far apart as possible.
+// Only spots you can walk to from the elevator count: some Silph areas are reachable only by teleport pads.
+const ZONE_PREFS = [
+  ['server',  [MB.LIGHTS, MB.COMPUTER, MB.PAINTING]],
+  ['dev',     [MB.COMPUTER, MB.PC, MB.LIGHTS, MB.PAINTING]],
+  ['search',  [MB.LIGHTS, MB.COMPUTER, MB.PC, MB.PAINTING]],
+  ['meeting', [MB.BLUEPRINTS, MB.COUNTER, MB.TELEPHONE, MB.PAINTING]],
+  ['archive', [MB.BLUEPRINTS, MB.COUNTER, MB.TELEPHONE, MB.COMPUTER, MB.LIGHTS, MB.PAINTING]],
+  ['desk',    [MB.TELEPHONE, MB.COUNTER, MB.COMPUTER, MB.LIGHTS, MB.PAINTING]],
+];
+const ZONE_GAP = 6; // tiles between rooms, so they don't pile up around one counter
+function nearest(L, [x0, y0], ok) { // closest standable tile by distance, walls or not in between
+  for (let r = 0; r < Math.max(L.w, L.h); r++)
+    for (let dy = -r; dy <= r; dy++)
+      for (const dx of [r - Math.abs(dy), Math.abs(dy) - r]) {
+        const x = x0 + dx, y = y0 + dy;
+        if (standable(L, x, y) && ok(x, y)) return [x, y];
+      }
+}
+function assignZones(L) {
+  const reach = new Set(), q = [L.front];
+  reach.add(L.front.join());
+  while (q.length) {
+    const [x, y] = q.shift();
+    for (const [dx, dy] of [[0, 1], [1, 0], [0, -1], [-1, 0]])
+      if (walkable(L, x + dx, y + dy) && !reach.has(`${x + dx},${y + dy}`)) { reach.add(`${x + dx},${y + dy}`); q.push([x + dx, y + dy]); }
+  }
+  const clusters = [], seen = new Set(), kinds = Object.values(MB);
+  for (let i = 0; i < L.w * L.h; i++) {
+    const b = L.behavior[i];
+    if (!kinds.includes(b) || seen.has(i)) continue;
+    const tiles = [], stack = [i];
+    seen.add(i);
+    while (stack.length) {
+      const j = stack.pop(), x = j % L.w, y = Math.floor(j / L.w);
+      tiles.push([x, y]);
+      for (const [dx, dy] of [[0, 1], [1, 0], [0, -1], [-1, 0]]) {
+        const n = (y + dy) * L.w + x + dx;
+        if (x + dx >= 0 && x + dx < L.w && y + dy >= 0 && y + dy < L.h && L.behavior[n] === b && !seen.has(n)) { seen.add(n); stack.push(n); }
+      }
+    }
+    const at = nearest(L, tiles[0], (x, y) => reach.has(`${x},${y}`));
+    if (at && Math.abs(at[0] - tiles[0][0]) + Math.abs(at[1] - tiles[0][1]) <= 3) clusters.push({ b, tiles, at });
+  }
+  const pts = [], used = new Set(), dist = (a, b) => Math.abs(a[0] - b[0]) + Math.abs(a[1] - b[1]);
+  const spread = at => pts.length ? Math.min(...pts.map(p => dist(p, at))) : 0;
+  L.zones = {};
+  for (const [zone, prefs] of ZONE_PREFS) {
+    let pick;
+    for (const b of prefs) {
+      const c = clusters.filter(c => c.b === b && !used.has(c) && (!pts.length || spread(c.at) >= ZONE_GAP));
+      if (c.length) { pick = c.sort((p, q) => spread(q.at) - spread(p.at) || q.tiles.length - p.tiles.length)[0]; break; }
+    }
+    if (pick) used.add(pick);
+    const at = pick ? pick.at : [...reach].map(k => k.split(',').map(Number)).sort((a, b) => spread(b) - spread(a))[0];
+    L.zones[zone] = { at, tiles: pick?.tiles || [], b: pick?.b };
+    pts.push(at);
+  }
+}
+
+// ---- UI graphics: FRLG message box, std window, arrow, emoticons, status icons ----
+const UI = {};
+const TEXT = { fill: 'rgb(255,255,255)', fg: [98, 98, 98], shadow: [213, 213, 205] }; // stdpal_0 colors 1..3
+
+async function loadUI() {
+  const [msg, frame, arrow, emo, status, shadow, msgpal, red, redpal] = await Promise.all([
+    png('graphics/text_window/menu_message.png'), png('graphics/text_window/type1.png'), png('graphics/fonts/down_arrows.png'),
+    png('graphics/misc/emoticons.png'), png('graphics/interface/status_icons.png'),
+    png('graphics/field_effects/pics/shadow_medium.png'), jasc('graphics/text_window/stdpal_0.pal'),
+    png('graphics/object_events/pics/people/red_normal.png'), jasc('graphics/object_events/palettes/player.pal'),
+  ]);
+  const tile = (img, pal, n, hf, vf) => cut(img, pal, (n % (img.w / 8)) * 8, Math.floor(n / (img.w / 8)) * 8, 8, 8, hf, vf);
+  UI.msg = n => tile(msg, msgpal, n & 0xff, false, n >= 0x100); // n | 0x100 = vertical flip
+  UI.frame = Array.from({ length: 9 }, (_, n) => tile(frame, frame.plte, n)); // options frame type 1 (the default)
+  UI.arrow = Array.from({ length: 4 }, (_, n) => cut(arrow, arrow.plte, n * 16, 0, 16, 16));
+  UI.emo = { '!': cut(emo, emo.plte, 32, 0, 16, 16), '?': cut(emo, emo.plte, 32, 64, 16, 16) };
+  UI.status = {};
+  for (const [name, n] of [['PAR', 1], ['SLP', 2]]) { // status icons sit in 32px cells; trim to the drawn part
+    let x0 = 32, x1 = 0;
+    for (let y = 0; y < 8; y++) for (let x = 0; x < 32; x++) if (status.px[y * status.w + n * 32 + x]) { x0 = Math.min(x0, x); x1 = Math.max(x1, x); }
+    UI.status[name] = cut(status, status.plte, n * 32 + x0, 0, x1 - x0 + 1, 8);
+  }
+  UI.shadow = cut(shadow);
+  // Red's overworld frames: 0 S, 1 N, 2 W, 3-4 S walk, 5-6 N walk, 7-8 W walk; east is west mirrored
+  UI.red = Array.from({ length: 9 }, (_, n) => cut(red, redpal, n * 16, 0, 16, 32));
+  UI.redEast = Array.from({ length: 9 }, (_, n) => cut(red, redpal, n * 16, 0, 16, 32, true));
+  UI.box = buildMessageBox();
+}
+
+// Message box exactly as WindowFunc_DrawDialogueFrame lays it out: window at tile (2, 35), 44x4 tiles.
+const BOX = { left: 2, top: H / 8 - 5, w: W / 8 - 4, h: 4 };
+function buildMessageBox() {
+  const c = Object.assign(document.createElement('canvas'), { width: W, height: 6 * 8 }), g = c.getContext('2d');
+  const { left: L, w } = BOX, V = 0x100;
+  const rows = [[0, 1, 2, 3, 4], [5, 6, -1, 8, 9], [10, 11, -1, 12, 13], [10 | V, 11 | V, -1, 12 | V, 13 | V], [5 | V, 6 | V, -1, 8 | V, 9 | V], [V, 1 | V, 2 | V, 3 | V, 4 | V]];
+  rows.forEach(([a, b, mid, d, e], r) => {
+    const y = r * 8;
+    g.drawImage(UI.msg(a), (L - 2) * 8, y); g.drawImage(UI.msg(b), (L - 1) * 8, y);
+    for (let i = 0; i < w; i++) {
+      if (mid < 0) { g.fillStyle = TEXT.fill; g.fillRect((L + i) * 8, y, 8, 8); }
+      else g.drawImage(UI.msg(mid), (L + i) * 8, y);
+    }
+    g.drawImage(UI.msg(d), (L + w) * 8, y); g.drawImage(UI.msg(e), (L + w + 1) * 8, y);
+  });
+  return c;
+}
+
+function frameWindow(g, x, y, w, h) { // in tiles
+  for (let ty = 0; ty < h; ty++)
+    for (let tx = 0; tx < w; tx++) {
+      const col = tx === 0 ? 0 : tx === w - 1 ? 2 : 1, row = ty === 0 ? 0 : ty === h - 1 ? 2 : 1;
+      if (col === 1 && row === 1) { g.fillStyle = TEXT.fill; g.fillRect((x + tx) * 8, (y + ty) * 8, 8, 8); }
+      else g.drawImage(UI.frame[row * 3 + col], (x + tx) * 8, (y + ty) * 8);
+    }
+}
+
+// ---- pixel text: Galmuri rendered then thresholded so it stays crisp, with FRLG's 3-way drop shadow ----
+const FONT = '12px Galmuri11', FONT_S = '10px Galmuri9';
+const measure = document.createElement('canvas').getContext('2d');
+const textCache = new Map();
+function text(g, s, x, y, font = FONT, fg = TEXT.fg, shadow = TEXT.shadow) {
+  const key = font + fg + shadow + s;
+  let c = textCache.get(key);
+  if (!c) {
+    measure.font = font;
+    const w = Math.ceil(measure.measureText(s).width) + 2, h = 16;
+    const m = Object.assign(document.createElement('canvas'), { width: w, height: h }).getContext('2d');
+    m.font = font; m.textBaseline = 'top'; m.fillText(s, 0, 1);
+    const src = m.getImageData(0, 0, w, h).data, out = new ImageData(w, h), on = (x, y) => x >= 0 && y >= 0 && src[(y * w + x) * 4 + 3] >= 128;
+    for (let yy = 0; yy < h; yy++)
+      for (let xx = 0; xx < w; xx++) {
+        const col = on(xx, yy) ? fg : on(xx - 1, yy) || on(xx, yy - 1) || on(xx - 1, yy - 1) ? shadow : null;
+        if (col) out.data.set([...col, 255], (yy * w + xx) * 4);
+      }
+    c = Object.assign(document.createElement('canvas'), { width: w, height: h });
+    c.getContext('2d').putImageData(out, 0, 0);
+    if (textCache.size > 400) textCache.clear();
+    textCache.set(key, c);
+  }
+  g.drawImage(c, Math.round(x), Math.round(y));
+  return c.width;
+}
+const textWidth = (s, font = FONT) => { measure.font = font; return measure.measureText(s).width; };
+function fit(s, max, font) {
+  if (textWidth(s, font) <= max) return s;
+  while (s && textWidth(s + '…', font) > max) s = s.slice(0, -1);
+  return s + '…';
+}
+
+// ---- rooms (placed per floor by assignZones) ----
+const ZONE_NAMES = { server: '서버실', archive: '자료실', dev: '개발실', search: '정보검색실', meeting: '회의실', desk: '내 자리' };
+const zoneOf = t =>
+  /^(Read|Grep|Glob|LS|NotebookRead)$/.test(t) ? 'archive' :
+  /^(Edit|Write|MultiEdit|NotebookEdit)$/.test(t) ? 'dev' :
+  /^(Bash|BashOutput|KillShell|KillBash|Monitor)$/.test(t) ? 'server' :
+  /^(WebSearch|WebFetch|ToolSearch)$/.test(t) || t?.startsWith('mcp__') ? 'search' :
+  /^(TodoWrite|TaskCreate|TaskUpdate|TaskList|TaskGet|EnterPlanMode|ExitPlanMode)$/.test(t) ? 'meeting' : 'desk';
+const isAgentTool = t => t === 'Task' || t === 'Agent';
+
+// Evolution chains: [national dex no, name, pret folder, level it evolves at].
+// Stone/trade evolutions have no level in the games, so they get a stand-in (marked *).
+const CHAINS = [
+  [[1,'이상해씨','bulbasaur'], [2,'이상해풀','ivysaur',16], [3,'이상해꽃','venusaur',32]],
+  [[4,'파이리','charmander'], [5,'리자드','charmeleon',16], [6,'리자몽','charizard',36]],
+  [[7,'꼬부기','squirtle'], [8,'어니부기','wartortle',16], [9,'거북왕','blastoise',36]],
+  [[25,'피카츄','pikachu'], [26,'라이츄','raichu',30]],          // * thunder stone
+  [[143,'잠만보','snorlax']],
+  [[16,'구구','pidgey'], [17,'피죤','pidgeotto',18], [18,'피죤투','pidgeot',36]],
+  [[92,'고오스','gastly'], [93,'고우스트','haunter',25], [94,'팬텀','gengar',38]], // * trade
+  [[147,'미뇽','dratini'], [148,'신뇽','dragonair',30], [149,'망나뇽','dragonite',55]],
+  [[54,'고라파덕','psyduck'], [55,'골덕','golduck',33]],
+  [[52,'나옹','meowth'], [53,'페르시온','persian',28]],
+  [[39,'푸린','jigglypuff'], [40,'푸크린','wigglytuff',30]],    // * moon stone
+];
+const AGENT_CHAINS = {
+  Explore: [[50,'디그다','diglett'], [51,'닥트리오','dugtrio',26]],
+  Plan: [[63,'캐이시','abra'], [64,'윤겔라','kadabra',16], [65,'후딘','alakazam',36]], // * trade
+  'general-purpose': [[81,'코일','magnemite'], [82,'레어코일','magneton',30]],
+};
+const CHILD_CHAINS = [ // any other subagent type: a familiar Gen 1 face, not one already on screen
+  [[10,'캐터피','caterpie'], [11,'단데기','metapod',7], [12,'버터플','butterfree',10]],
+  [[13,'뿔충이','weedle'], [14,'딱충이','kakuna',7], [15,'독침붕','beedrill',10]],
+  [[19,'꼬렛','rattata'], [20,'레트라','raticate',20]],
+  [[21,'깨비참','spearow'], [22,'깨비드릴조','fearow',20]],
+  [[23,'아보','ekans'], [24,'아보크','arbok',22]],
+  [[27,'모래두지','sandshrew'], [28,'고지','sandslash',22]],
+  [[35,'삐삐','clefairy'], [36,'픽시','clefable',30]],            // * moon stone
+  [[37,'식스테일','vulpix'], [38,'나인테일','ninetales',30]],     // * fire stone
+  [[41,'주뱃','zubat'], [42,'골뱃','golbat',22]],
+  [[43,'뚜벅쵸','oddish'], [44,'냄새꼬','gloom',21], [45,'라플레시아','vileplume',36]], // * leaf stone
+  [[60,'발챙이','poliwag'], [61,'슈륙챙이','poliwhirl',25], [62,'강챙이','poliwrath',40]], // * water stone
+  [[66,'알통몬','machop'], [67,'근육몬','machoke',28], [68,'괴력몬','machamp',40]], // * trade
+  [[74,'꼬마돌','geodude'], [75,'데구리','graveler',25], [76,'딱구리','golem',40]], // * trade
+  [[77,'포니타','ponyta'], [78,'날쌩마','rapidash',40]],
+  [[79,'야돈','slowpoke'], [80,'야도란','slowbro',37]],
+  [[83,'파오리','farfetchd']],
+  [[95,'롱스톤','onix']],
+  [[96,'슬리프','drowzee'], [97,'슬리퍼','hypno',26]],
+  [[98,'크랩','krabby'], [99,'킹크랩','kingler',28]],
+  [[100,'찌리리공','voltorb'], [101,'붐볼','electrode',30]],
+  [[104,'탕구리','cubone'], [105,'텅구리','marowak',28]],
+  [[109,'또가스','koffing'], [110,'또도가스','weezing',35]],
+  [[116,'쏘드라','horsea'], [117,'시드라','seadra',32]],
+  [[120,'별가사리','staryu'], [121,'아쿠스타','starmie',30]],    // * water stone
+  [[123,'스라크','scyther']],
+  [[129,'잉어킹','magikarp'], [130,'갸라도스','gyarados',20]],
+  [[131,'라프라스','lapras']],
+  [[132,'메타몽','ditto']],
+  [[133,'이브이','eevee']],
+  [[137,'폴리곤','porygon']],
+];
+const START_LV = 5;
+
+const hash = s => [...String(s)].reduce((h, c) => (h * 31 + c.charCodeAt(0)) | 0, 7) >>> 0;
+const josa = (w, a, b) => { const c = w.charCodeAt(w.length - 1) - 0xac00; return c >= 0 && c <= 11171 && c % 28 ? a : b; };
+const ro = w => { const c = (w.charCodeAt(w.length - 1) - 0xac00) % 28; return c > 0 && c !== 8 ? '으로' : '로'; }; // ㄹ takes 로
+
+// PMD SpriteCollab walk/idle/sleep sheets: 8 direction rows, durations in 1/60s
+const PMD = 'https://raw.githubusercontent.com/PMDCollab/SpriteCollab/master/sprite/';
+const DIR = { down: 0, right: 2, up: 4, left: 6 };
+const sheets = {}, icons = {};
+function sheet(dex) {
+  if (sheets[dex]) return sheets[dex];
+  const s = sheets[dex] = {}, base = PMD + String(dex).padStart(4, '0') + '/';
+  fetch(base + 'AnimData.xml').then(r => r.text()).then(xml => {
+    const anims = {};
+    for (const a of new DOMParser().parseFromString(xml, 'text/xml').querySelectorAll('Anim'))
+      anims[a.querySelector('Name').textContent] = a;
+    for (const name of ['Walk', 'Idle', 'Sleep']) {
+      let a = anims[name];
+      while (a?.querySelector('CopyOf')) a = anims[a.querySelector('CopyOf').textContent];
+      if (!a) continue;
+      const img = new Image();
+      img.src = base + a.querySelector('Name').textContent + '-Anim.png';
+      s[name] = { img, w: +a.querySelector('FrameWidth').textContent, h: +a.querySelector('FrameHeight').textContent,
+                  dur: [...a.querySelectorAll('Duration')].map(d => +d.textContent) };
+    }
+  }).catch(() => {});
+  return s;
+}
+function icon(slug) { // FRLG party icon, 2 frames of 32x32
+  if (!icons[slug]) {
+    icons[slug] = [];
+    png(`graphics/pokemon/${slug}/icon.png`).then(img => icons[slug].push(cut(img, img.plte, 0, 0, 32, 32), cut(img, img.plte, 0, 32, 32, 32))).catch(() => {});
+  }
+  return icons[slug];
+}
+
+// ---- floors: one per project, like a department store directory ----
+const floors = []; // project cwd per floor, in order of first appearance
+let floor = 0, lift = null; // lift: { from, to, t } while the elevator indicator shows
+const floorOf = cwd => { let i = floors.indexOf(cwd); if (i < 0) { i = floors.length; floors.push(cwd); } return i; };
+const baseName = p => (p || '').split(/[\\/]/).pop() || '?';
+
+// ---- pokémon state ----
+const mons = new Map();
+let live = false;
+const tileOf = m => [Math.floor(m.x / 16), Math.floor(m.y / 16)];
+const walkable = (L, x, y) => x >= 0 && y >= 0 && x < L.w && y < L.h && !L.blocked[y * L.w + x];
+const standable = (L, x, y) => walkable(L, x, y) && !L.covered[y * L.w + x];
+const onFloor = f => [...mons.values()].filter(m => m.floor === f && !m.leaving);
+
+function bfs(L, from, done) { // 4-way flood over walkable tiles; returns path to the first tile where done() is true
+  const prev = new Map([[from.join(), null]]), q = [from];
+  while (q.length) {
+    const cur = q.shift();
+    if (done(...cur)) {
+      const path = [];
+      for (let k = cur; k; k = prev.get(k.join())) path.unshift(k);
+      return path;
+    }
+    for (const [dx, dy] of [[0, 1], [1, 0], [0, -1], [-1, 0]]) {
+      const n = [cur[0] + dx, cur[1] + dy];
+      if (walkable(L, ...n) && !prev.has(n.join())) { prev.set(n.join(), cur); q.push(n); }
+    }
+  }
+  return [from];
+}
+
+// Tiles other pokémon on the same floor are heading to, or own as their desk.
+const taken = m => new Set(onFloor(m.floor).filter(o => o !== m).flatMap(o => [o.goal?.join(), o.home?.join()]));
+const freeNear = (m, at, not = () => false) => {
+  const L = levelOf(m.floor);
+  return bfs(L, at, (x, y) => standable(L, x, y) && !not(x, y) && !taken(m).has(x + ',' + y)).pop();
+};
+function go(m, goal) {
+  m.goal = goal;
+  m.path = bfs(levelOf(m.floor), tileOf(m), (x, y) => x === goal[0] && y === goal[1]).slice(1);
+  m.speed = m.path.length > 10 ? 2 : 1; // run across the floor, walk within a room
+}
+function place(m, zone) {
+  m.zone = zone;
+  go(m, zone === 'desk' ? m.home : freeNear(m, levelOf(m.floor).zones[zone].at));
+}
+
+function setForm(m, stage) {
+  m.stage = stage;
+  [m.dex, m.name, m.slug] = m.chain[stage];
+  sheet(m.dex); icon(m.slug);
+}
+function setLevel(m, lv) { // silent, for work done before we started watching
+  m.lv = lv;
+  let st = 0;
+  while (m.chain[st + 1] && lv >= m.chain[st + 1][3]) st++;
+  setForm(m, st);
+}
+function spawn(key, chain, label, parent, floor) {
+  const [ex, ey] = levelOf(floor).elevator;
+  const m = { key, chain, label, parent, floor, x: ex * 16 + 8, y: ey * 16 + 15, path: [], dir: 'down',
+              emote: '', status: '', lv: START_LV, doing: '', appearAt: 0 };
+  setForm(m, 0);
+  mons.set(key, m);
+  m.home = freeNear(m, levelOf(floor).zones.desk.at);
+  return m;
+}
+// One level per tool call; evolve at the chain's level, with the FRLG evolution lines.
+function levelUp(m) {
+  m.lv++;
+  const next = m.chain[m.stage + 1];
+  if (!next || m.lv < next[3]) return;
+  const old = m.name;
+  if (live) m.evo = { t: null, from: m.dex }; // keep the old look until the dialog gets there
+  setForm(m, m.stage + 1);
+  logAct(m, whereOf(m), `${old} → ${m.name} 진화!`, 'evo');
+  say(m, `어라…!? ${old}의 모습이…!`, { keep: true, onShow: () => { if (m.evo) m.evo.t = performance.now(); } });
+  say(m, `축하합니다! ${old}${josa(old, '은', '는')}\n${m.name}${ro(m.name)} 진화했습니다!`, { keep: true });
+}
+// Everyone arrives and leaves through the elevator.
+function leave(m) {
+  if (!m || m.leaving) return;
+  m.leaving = true; m.goal = null;
+  const L = levelOf(m.floor);
+  m.path = [...bfs(L, tileOf(m), (x, y) => x === L.front[0] && y === L.front[1]).slice(1), L.elevator];
+}
+
+function session(ev) {
+  let m = mons.get(ev.session);
+  if (!m) {
+    const used = new Set([...mons.values()].map(o => o.chain)), h = hash(ev.session);
+    const chain = CHAINS.map((_, i) => CHAINS[(h + i) % CHAINS.length]).find(c => !used.has(c)) || CHAINS[h % CHAINS.length];
+    m = spawn(ev.session, chain, baseName(ev.cwd), null, floorOf(ev.cwd));
+    place(m, 'desk');
+    say(m, `${m.name}${josa(m.name, '이', '가')} 엘리베이터를 타고 출근했다!`);
+    logAct(m, '엘리베이터', `출근 (${m.label})`, 'in');
+  }
+  return m;
+}
+
+// Subagents: called by phone from the desk, arrive by elevator a moment later.
+function spawnChild(p, key, agentType, delay) {
+  const used = new Set([...mons.values()].map(o => o.chain)), h = hash(key);
+  const chain = AGENT_CHAINS[agentType] ||
+    CHILD_CHAINS.map((_, i) => CHILD_CHAINS[(h + i) % CHILD_CHAINS.length]).find(c => !used.has(c)) || CHILD_CHAINS[h % CHILD_CHAINS.length];
+  const c = spawn(key, chain, agentType || 'agent', p.key, p.floor);
+  c.appearAt = performance.now() + (live ? delay : 0);
+  place(c, 'desk');
+  return c;
+}
+// Done: walk over to whoever called, report, say goodbye, take the elevator.
+function report(c) {
+  if (!c || c.reporting || c.leaving) return;
+  if (!live) return leave(c);
+  c.reporting = true;
+  const p = mons.get(c.parent), at = p?.goal || (p ? tileOf(p) : c.home);
+  go(c, freeNear(c, at, (x, y) => x === at[0] && y === at[1]));
+}
+function tickReports(t) {
+  for (const c of mons.values()) {
+    if (!c.reporting || c.leaving || c.path.length) continue;
+    evT = Date.now();
+    if (!c.reportT) {
+      c.reportT = t; bubble(c, '보고드립니다!', 'talk', 1800, true);
+      logAct(c, '내 자리', `${mons.get(c.parent)?.name ?? '팀'}에게 보고: ${c.lastSay || c.task || '맡은 일 완료'}`, 'report');
+      say(c, `${c.name}: "${c.task || '맡은 일'}"\n다 끝났습니다!`, { force: true });
+    } else if (!c.byeT && t - c.reportT > 1800) {
+      c.byeT = t; bubble(c, '퇴근합니다!', 'talk', 1600, true);
+    } else if (c.byeT && t - c.byeT > 1600) { leave(c); logAct(c, '엘리베이터', '퇴근', 'out'); }
+  }
+}
+
+function bubble(m, text, kind = 'talk', ms = 3000, force = false) {
+  if (text && (live || force)) m.bubble = { text, kind, until: performance.now() + ms };
+}
+
+// ---- activity log: when, which floor, who, where, what ----
+const activity = [];
+let evT = Date.now(); // time of the event being handled
+const whereOf = m => ZONE_NAMES[m.zone] || '내 자리';
+let logScroll = 0, logUnread = 0; // lines scrolled up from the newest; 0 = follow new entries
+function logAct(m, where, what, kind = '') {
+  activity.push({ t: evT, floor: m.floor, who: m.name, where, what, kind });
+  activity.sort((a, b) => a.t - b.t); // transcripts replay one after another, so keep it in time order
+  if (activity.length > 2000) activity.shift();
+  if (logScroll > 0) { logScroll++; logUnread++; } // reading older lines: keep the view still
+}
+
+function apply(ev) {
+  live = Date.now() - ev.t < 5000;
+  evT = ev.t;
+  if (ev.event === 'SessionEnd') {
+    const s = mons.get(ev.session);
+    if (!s) return;
+    for (const c of mons.values()) if (c.parent === s.key) leave(c);
+    leave(s);
+    say(s, `${s.name}${josa(s.name, '은', '는')} 퇴근했다!`);
+    logAct(s, '엘리베이터', '퇴근', 'out');
+    return;
+  }
+  const s = session(ev);
+  if (ev.event === 'Init') return setLevel(s, START_LV + ev.toolCount);
+  if (ev.event === 'SessionStart') return;
+  const m = ev.parentToolId ? mons.get(ev.parentToolId) || spawnChild(s, ev.parentToolId, ev.agentType, 0) : s, N = m.name;
+  m.lastT = ev.t;
+  if (ev.event !== 'Stop') {
+    if (m.status === 'SLP') say(m, `${N}${josa(N, '은', '는')} 눈을 떴다!`);
+    m.status = ''; m.emote = '';
+  }
+
+  switch (ev.event) {
+    case 'UserPromptSubmit':
+      place(m, 'desk'); m.emote = '?'; m.doing = '내 자리 · 생각하는 중';
+      if (live) visit(m, ev.detail ?? '');
+      logAct(m, '내 자리', `트레이너: "${ev.detail ?? ''}"`, 'prompt');
+      break;
+    case 'Say': // what Claude writes between tool calls: shown as a thought cloud
+      bubble(m, ev.detail, 'think', 3500);
+      m.lastSay = ev.detail;
+      logAct(m, whereOf(m), ev.detail, 'think');
+      break;
+    case 'PreToolUse':
+      m.running = ev.toolId;
+      if (isAgentTool(ev.tool)) {
+        place(m, 'desk');
+        bubble(m, '따르릉! 지원 요청합니다', 'talk', 1800);
+        const c = spawnChild(m, ev.toolId, ev.agentType, 1800);
+        c.task = c.doing = ev.detail || '';
+        logAct(m, '내 자리', `전화로 ${c.name} 호출 (${ev.agentType || 'agent'})`, 'call');
+        logAct(c, '엘리베이터', `출근 · ${c.task || '지원 업무'}`, 'in');
+        say(m, `${N}${josa(N, '이', '가')} 전화로 지원을 요청했다!\n${c.name}${josa(c.name, '이', '가')} 엘리베이터를 타고 출근했다!`);
+      } else if (ev.tool === 'AskUserQuestion') {
+        place(m, 'desk'); m.emote = '!'; m.status = 'PAR'; m.doing = '내 자리 · 트레이너를 기다리는 중';
+        bubble(m, ev.detail || '여쭤볼 게 있어요!', 'talk', 6000);
+        logAct(m, '내 자리', `질문: ${ev.detail || ''}`, 'ask');
+        say(m, `${N}${josa(N, '이', '가')} 트레이너에게\n물어볼 게 있는 것 같다!`, { keep: true });
+      } else {
+        const zone = zoneOf(ev.tool);
+        place(m, zone);
+        m.doing = `${ZONE_NAMES[zone]} · ${ev.tool}${ev.detail ? ' ' + ev.detail : ''}`;
+        bubble(m, `${ev.tool}${ev.detail ? ' ' + ev.detail : ''}`, 'talk', 2500);
+        logAct(m, ZONE_NAMES[zone], `${ev.tool}${ev.detail ? ' ' + ev.detail : ''}`);
+      }
+      levelUp(m);
+      break;
+    case 'PostToolUse':
+      if (m.running === ev.toolId) m.running = null;
+      if (ev.error) {
+        m.sweatUntil = performance.now() + 3500;
+        bubble(m, `${ev.tool ?? '도구'} 실패…`, 'error', 3500);
+        say(m, `${N}의 ${ev.tool ?? '공격'}!\n그러나 실패하고 말았다!`);
+        logAct(m, whereOf(m), `${ev.tool ?? '도구'} 실패`, 'error');
+      }
+      if (isAgentTool(ev.tool) && !ev.async) report(mons.get(ev.toolId)); // async agents report when they stop
+      break;
+    case 'Stop':
+      m.running = null;
+      if (m.parent) report(m);
+      else { place(m, 'desk'); m.status = 'SLP'; m.doing = '내 자리 · 쉬는 중'; logAct(m, '내 자리', '응답 완료, 쉬는 중', 'done'); }
+      break;
+  }
+}
+
+// ---- message box (typewriter, 2 lines per page, red ▼ between pages) ----
+const queue = [];
+let box = null; // { lines, shown, done, until }
+const LINE_W = BOX.w * 8 - 16;
+
+function wrap(s) {
+  const out = [];
+  for (const para of s.split('\n')) {
+    let line = '';
+    for (const ch of para) {
+      if (textWidth(line + ch) > LINE_W) { out.push(line); line = ''; }
+      line += ch;
+    }
+    out.push(line);
+  }
+  return out;
+}
+// Only the floor you're looking at talks. Evolution lines are never dropped.
+function say(m, s, { keep = false, onShow, force = false } = {}) {
+  if (!(live || force) || m.floor !== floor) { onShow?.(); return; }
+  for (let i = 0, lines = wrap(s); i < lines.length; i += 2) queue.push(Object.assign(lines.slice(i, i + 2), { keep, onShow: i ? null : onShow }));
+  while (queue.length > 8) {
+    const i = queue.findIndex(q => !q.keep);
+    if (i < 0) break;
+    queue.splice(i, 1);
+  }
+}
+function tickBox(t) {
+  if (box && box.done && t > box.until) box = null;
+  if (!box && queue.length) { box = { lines: queue.shift(), start: t, done: false }; box.lines.onShow?.(); }
+  if (!box) return;
+  const total = box.lines.join('').length, speed = queue.length > 2 ? 10 : 35;
+  box.shown = Math.min(total, Math.floor((t - box.start) / speed));
+  if (!box.done && box.shown >= total) { box.done = true; box.until = t + (queue.length ? 700 : 3500); }
+}
+function drawBox(t) {
+  if (!box) return;
+  ctx.drawImage(UI.box, 0, (BOX.top - 1) * 8);
+  let left = box.shown;
+  box.lines.forEach((line, i) => {
+    const part = line.slice(0, Math.max(0, left));
+    left -= line.length;
+    if (part) text(ctx, part, BOX.left * 8, BOX.top * 8 + i * 16);
+  });
+  if (box.done && queue.length) ctx.drawImage(UI.arrow[Math.floor(t / 130) % 4], (BOX.left + BOX.w) * 8 - 12, BOX.top * 8 + 18);
+}
+
+// ---- drawing ----
+const scratch = document.createElement('canvas'), sg = scratch.getContext('2d');
+function drawAnim(a, x, y, row, t, white) {
+  const total = a.dur.reduce((p, c) => p + c, 0);
+  let f = Math.floor(t * 0.06) % total, i = 0;
+  while (f >= a.dur[i]) f -= a.dur[i++];
+  const r = Math.min(row, a.img.naturalHeight / a.h - 1), dx = Math.round(x - a.w / 2), dy = Math.round(y - a.h / 2);
+  if (!white) return ctx.drawImage(a.img, i * a.w, r * a.h, a.w, a.h, dx, dy, a.w, a.h);
+  scratch.width = a.w; scratch.height = a.h; // white silhouette, as in the evolution scene
+  sg.drawImage(a.img, i * a.w, r * a.h, a.w, a.h, 0, 0, a.w, a.h);
+  sg.globalCompositeOperation = 'source-in'; sg.fillStyle = '#fff'; sg.fillRect(0, 0, a.w, a.h);
+  ctx.drawImage(scratch, dx, dy);
+}
+
+function step(m, dt) {
+  let budget = dt * 0.0625 * (m.speed || 1); // FRLG walking speed: 1 tile per 16 frames
+  while (budget > 0 && m.path.length) {
+    const tx = m.path[0][0] * 16 + 8, ty = m.path[0][1] * 16 + 15, dx = tx - m.x, dy = ty - m.y, d = Math.hypot(dx, dy);
+    if (d > 0.01) m.dir = Math.abs(dx) > Math.abs(dy) ? (dx > 0 ? 'right' : 'left') : (dy > 0 ? 'down' : 'up');
+    if (d <= budget) { m.x = tx; m.y = ty; m.path.shift(); budget -= d; }
+    else { m.x += dx / d * budget; m.y += dy / d * budget; budget = 0; }
+  }
+  if (!m.path.length && !m.keepDir) m.dir = 'down';
+}
+
+function drawMon(m, t) {
+  const x = Math.round(m.x), y = Math.round(m.y);
+  const EVO_MS = 2600, e = m.evo?.t != null ? t - m.evo.t : Infinity;
+  m.top = y - 24;
+  if (e < EVO_MS) { // flicker between old and new silhouettes, faster and faster
+    const sh = sheet(Math.floor(e / (260 - 200 * e / EVO_MS)) % 2 ? m.dex : m.evo.from), a = sh.Idle || sh.Walk;
+    ctx.drawImage(UI.shadow, x - 8, y - 6);
+    if (a?.img.complete && a.img.naturalWidth) drawAnim(a, m.x, m.y - 6, 0, t, true);
+    return;
+  }
+  const sh = sheet(m.evo?.t === null ? m.evo.from : m.dex), moving = m.path.length > 0;
+  const a = m.status === 'SLP' && !moving ? (sh.Sleep || sh.Idle) : moving ? sh.Walk : (sh.Idle || sh.Walk);
+  ctx.drawImage(UI.shadow, x - 8, y - 6);
+  if (a?.img.complete && a.img.naturalWidth) {
+    drawAnim(a, m.x, m.y - 6, DIR[m.dir], t + hash(m.key) % 1000);
+    m.top = Math.round(m.y - 6 - a.h / 2 + 6);
+  }
+}
+
+// Emote, cold sweat and speech bubble go above everything, including roofs and wall tops.
+let bubbleRects = []; // bubbles drawn this frame
+function drawOverlay(m, t) {
+  const x = Math.round(m.x);
+  if (t < m.sweatUntil) {
+    const sx = x + 7, sy = m.top + 4 + Math.floor(t / 150) % 3;
+    ctx.fillStyle = '#2858b8'; ctx.fillRect(sx, sy, 2, 4); ctx.fillRect(sx - 1, sy + 2, 4, 3);
+    ctx.fillStyle = '#90d0f8'; ctx.fillRect(sx, sy + 2, 1, 2);
+  }
+  const b = m.bubble;
+  if (!b || t > b.until) {
+    if (m.emote && UI.emo[m.emote]) ctx.drawImage(UI.emo[m.emote], x - 8, m.top - 16);
+    return;
+  }
+  const err = b.kind === 'error', line = err ? [230, 8, 8] : TEXT.fg, c = `rgb(${line})`;
+  const s = fit(b.text, 150, FONT_S), w = Math.ceil(textWidth(s, FONT_S)) + 8, h = 15;
+  const bx = Math.max(1, Math.min(levelOf(floor).w * 16 - w - 1, x - Math.round(w / 2)));
+  let by = Math.max(1, m.top - h - 6);
+  const hits = r => bx < r[0] + r[2] && r[0] < bx + w && by < r[1] + r[3] && r[1] < by + h + 2;
+  for (let i = 0; i < 4 && bubbleRects.some(hits); i++) by -= h + 3; // stack instead of overlapping
+  bubbleRects.push([bx, by, w, h]);
+  ctx.fillStyle = c; ctx.fillRect(bx + 1, by, w - 2, h); ctx.fillRect(bx, by + 1, w, h - 2);
+  ctx.fillStyle = '#fff'; ctx.fillRect(bx + 1, by + 1, w - 2, h - 2);
+  const tx = Math.max(bx + 4, Math.min(bx + w - 5, x));
+  if (b.kind === 'think') { // cloud: two little puffs instead of a tail
+    for (const [px, py, r] of [[tx - 1, by + h + 1, 3], [tx - 3, by + h + 5, 2]]) {
+      ctx.fillStyle = c; ctx.fillRect(px - 1, py - 1, r + 2, r + 2);
+      ctx.fillStyle = '#fff'; ctx.fillRect(px, py, r, r);
+    }
+  } else {
+    ctx.fillStyle = c; ctx.fillRect(tx - 2, by + h - 1, 5, 1); ctx.fillRect(tx - 1, by + h, 3, 1); ctx.fillRect(tx, by + h + 1, 1, 1);
+    ctx.fillStyle = '#fff'; ctx.fillRect(tx - 1, by + h - 1, 3, 1); ctx.fillRect(tx, by + h, 1, 1);
+  }
+  text(ctx, s, bx + 4, by + 1, FONT_S, line, err ? [248, 200, 200] : TEXT.shadow);
+}
+
+// Rooms come alive while someone on this floor is working in them, drawn onto that room's own equipment tiles.
+function drawRooms(L, t) {
+  const busy = zone => onFloor(floor).some(m => m.running && m.zone === zone && !m.path.length);
+  for (const zone of ['server', 'search', 'dev']) {
+    if (!busy(zone)) continue;
+    const { tiles, b } = L.zones[zone];
+    for (const [x, y] of tiles) {
+      const px = x * 16, py = y * 16;
+      if (b === MB.LIGHTS && zone === 'search') { // scanline sweeping the screen
+        ctx.fillStyle = 'rgba(255,255,255,.75)'; ctx.fillRect(px + 1, py + 11 + Math.floor(t / 70) % 7, 13, 1);
+      } else if (b === MB.LIGHTS) { // rack LEDs blinking fast
+        for (let k = 0; k < 4; k++) {
+          ctx.fillStyle = hash(`${x}${y}${k}${Math.floor(t / 90)}`) % 3 ? ['#f84848', '#48e848', '#f8d830', '#58b0f8'][k] : '#404850';
+          ctx.fillRect(px + 3 + (k % 2) * 3, py + 8 + (k >> 1) * 3, 2, 2);
+        }
+      } else for (let r = 0; r < 9; r += 2) { // code scrolling on a computer screen
+        ctx.fillStyle = ['#f8f8f8', '#88f888', '#f8d860'][(r + Math.floor(t / 120)) % 3];
+        ctx.fillRect(px + 2, py + 3 + r, 1 + (hash(r + Math.floor(t / 120)) % 3), 1);
+      }
+    }
+  }
+}
+
+function drawParty(t) {
+  frameWindow(ctx, 0, 0, PARTY_W / 8, H / 8);
+  const all = onFloor(floor);
+  const list = all.filter(m => !m.parent).flatMap(p => [p, ...all.filter(c => c.parent === p.key)]).filter(m => t >= m.appearAt);
+  if (!list.length) { text(ctx, '포켓몬이 없다…', 12, 12); return; }
+  list.slice(0, Math.floor((H - 16) / 34)).forEach((m, i) => {
+    const x = m.parent ? 18 : 6, y = 8 + i * 34, ic = icons[m.slug];
+    if (ic?.length === 2) ctx.drawImage(ic[Math.floor(t / 200 + i) % 2], x, y - 4);
+    text(ctx, fit(m.name, 104 - x - 30, FONT), x + 32, y);
+    const lv = `Lv${m.lv}`;
+    text(ctx, lv, 152 - textWidth(lv, FONT_S) - 2, y + 2, FONT_S);
+    let sx = x + 32;
+    if (m.status && UI.status[m.status]) { ctx.drawImage(UI.status[m.status], sx, y + 17); sx += UI.status[m.status].width + 3; }
+    text(ctx, fit(m.doing || `${m.label} · 대기 중`, 152 - sx, FONT_S), sx, y + 13, FONT_S);
+  });
+}
+
+// Room name plates over each room's equipment, so you can tell where everyone is.
+function drawRoomNames(L) {
+  for (const [zone, { tiles, at }] of Object.entries(L.zones)) {
+    const [x, y] = tiles.length ? tiles.reduce((a, b) => (b[1] < a[1] || (b[1] === a[1] && b[0] < a[0]) ? b : a)) : at;
+    const name = ZONE_NAMES[zone], w = Math.ceil(textWidth(name, FONT_S)) + 6, px = Math.max(0, x * 16), py = Math.max(0, y * 16 - 13);
+    ctx.fillStyle = 'rgba(32,40,56,.7)'; ctx.fillRect(px, py, w, 12);
+    text(ctx, name, px + 3, py - 1, FONT_S, [248, 248, 248], [32, 40, 56]);
+  }
+}
+
+const LOG_COLORS = { error: [230, 8, 8], evo: [40, 96, 200], prompt: [32, 128, 64], think: [150, 150, 150], report: [176, 96, 16], call: [176, 96, 16], ask: [176, 96, 16] };
+const LOG_ROWS = Math.floor((LOG_H - 30) / 13);
+function drawLog() {
+  frameWindow(ctx, 0, 0, CW / 8, LOG_H / 8);
+  text(ctx, '활동 로그', 10, 6, FONT_S);
+  for (const [label, x] of [['층', 64], ['누가', 86], ['어디서', 150], ['무엇을', 222]]) text(ctx, label, x, 6, FONT_S, [150, 150, 150]);
+  logScroll = Math.max(0, Math.min(logScroll, activity.length - LOG_ROWS));
+  if (!logScroll) logUnread = 0;
+  const start = Math.max(0, activity.length - LOG_ROWS - logScroll);
+  activity.slice(start, start + LOG_ROWS).forEach((a, i) => { // oldest on top, newest at the bottom
+    const y = 21 + i * 13;
+    text(ctx, new Date(a.t).toTimeString().slice(0, 8), 10, y, FONT_S);
+    text(ctx, `${a.floor + 1}F`, 64, y, FONT_S);
+    text(ctx, fit(a.who, 60, FONT_S), 86, y, FONT_S);
+    text(ctx, fit(a.where, 68, FONT_S), 150, y, FONT_S, [40, 96, 160]);
+    text(ctx, fit(a.what, CW - 246, FONT_S), 222, y, FONT_S, LOG_COLORS[a.kind] || TEXT.fg);
+  });
+  if (activity.length > LOG_ROWS) { // scrollbar
+    const trackY = 20, trackH = LOG_ROWS * 13, thumbH = Math.max(8, trackH * LOG_ROWS / activity.length);
+    const thumbY = trackY + (trackH - thumbH) * start / (activity.length - LOG_ROWS);
+    ctx.fillStyle = 'rgb(213,213,205)'; ctx.fillRect(CW - 14, trackY, 3, trackH);
+    ctx.fillStyle = 'rgb(98,98,98)'; ctx.fillRect(CW - 14, Math.round(thumbY), 3, Math.round(thumbH));
+  }
+  if (logScroll) {
+    const label = logUnread ? `▼ 새 로그 ${logUnread}개` : '▼ 최신으로';
+    const w = Math.ceil(textWidth(label, FONT_S)) + 8, x = CW - 24 - w, y = LOG_H - 24;
+    ctx.fillStyle = 'rgba(40,96,160,.9)'; ctx.fillRect(x, y, w, 13);
+    text(ctx, label, x + 4, y, FONT_S, [248, 248, 248], [40, 96, 160]);
+    logJump = [x, H + y, w, 13];
+  } else logJump = null;
+}
+let logJump = null; // clickable "jump to newest" area, in canvas coords
+cv.addEventListener('wheel', e => {
+  const r = cv.getBoundingClientRect();
+  if ((e.clientY - r.top) * cv.height / r.height < H) return; // only the log scrolls
+  e.preventDefault();
+  logScroll -= Math.sign(e.deltaY) * Math.max(1, Math.round(Math.abs(e.deltaY) / 40));
+}, { passive: false });
+
+// Floor directory, top floor first. A green lamp means someone there is working.
+let guideRows = [];
+function drawGuide(t) {
+  frameWindow(ctx, 0, 0, GUIDE_W / 8, H / 8);
+  text(ctx, '층별 안내', 10, 8, FONT_S);
+  guideRows = floors.map((cwd, i) => ({ i, y: 26 + (floors.length - 1 - i) * 18 }));
+  for (const { i, y } of guideRows) {
+    const busy = onFloor(i).some(m => m.running || Date.now() - (m.lastT || 0) < 8000);
+    if (i === (lift ? lift.to : floor)) text(ctx, '▶', 6, y, FONT_S);
+    text(ctx, `${i + 1}F`, 16, y, FONT_S);
+    text(ctx, fit(baseName(floors[i]), 50, FONT_S), 34, y, FONT_S);
+    ctx.fillStyle = busy ? (Math.floor(t / 400) % 2 ? '#38d838' : '#20a020') : '#a0a0a0';
+    ctx.fillRect(GUIDE_W - 13, y + 4, 4, 4);
+  }
+  ['방향키  이동', 'Shift  달리기', 'Z  말 걸기'].forEach((l, i) => text(ctx, l, 10, H - 54 + i * 14, FONT_S));
+}
+cv.addEventListener('click', e => {
+  const r = cv.getBoundingClientRect(), x = (e.clientX - r.left) * CW / r.width, y = (e.clientY - r.top) * cv.height / r.height;
+  if (logJump && x >= logJump[0] && x < logJump[0] + logJump[2] && y >= logJump[1] && y < logJump[1] + logJump[3]) { logScroll = 0; return; }
+  if (x >= GUIDE_W || y >= H) return;
+  const row = guideRows.find(g => y >= g.y - 2 && y < g.y + 16);
+  if (row) startLift(row.i);
+});
+function startLift(to) {
+  if (to === floor || lift) return;
+  lift = { from: floor, to, t: performance.now() };
+  queue.length = 0; box = null;
+}
+
+// Elevator ride: fade out, switch floors, fade in, with the ▲/▼ floor indicator on top.
+function drawLift(t) {
+  if (!lift) return;
+  const e = t - lift.t;
+  if (e > 500 && floor !== lift.to) { // the trainer rides along and steps out of the elevator
+    floor = lift.to;
+    const [fx, fy] = levelOf(floor).front;
+    Object.assign(trainer, { x: fx * 16 + 8, y: fy * 16 + 15, path: [], dir: 'down' });
+    if (trainer.visit) trainer.visit.started = false;
+  }
+  if (e > 1300) { lift = null; return; }
+  ctx.fillStyle = `rgba(0,0,0,${e < 500 ? e / 500 : Math.max(0, 1 - (e - 700) / 600)})`;
+  ctx.fillRect(0, 0, W, H);
+  const label = `${lift.to > lift.from ? '▲' : '▼'} ${lift.to + 1}F`;
+  frameWindow(ctx, W / 16 - 4, 2, 8, 4);
+  text(ctx, label, W / 2 - textWidth(label) / 2, 24);
+}
+
+// ---- the trainer (you): arrow keys / WASD to walk, Shift to run, Z / Space / Enter to talk ----
+const trainer = { x: 0, y: 0, path: [], dir: 'down', keepDir: true, speed: 1, visit: null }; // placed once the world loads
+const KEYS = { ArrowUp: 'up', ArrowDown: 'down', ArrowLeft: 'left', ArrowRight: 'right', w: 'up', s: 'down', a: 'left', d: 'right' };
+const DELTA = { up: [0, -1], down: [0, 1], left: [-1, 0], right: [1, 0] };
+const held = [];
+const monAt = (x, y) => onFloor(floor).find(m => { const [mx, my] = tileOf(m); return mx === x && my === y; });
+
+addEventListener('keydown', e => {
+  const d = KEYS[e.key];
+  if (d) { if (!held.includes(d)) held.push(d); trainer.visit = null; e.preventDefault(); }
+  else if (e.key === 'Shift') trainer.speed = 2;
+  else if ((e.key === 'z' || e.key === ' ' || e.key === 'Enter') && !e.repeat) { talk(); e.preventDefault(); }
+});
+addEventListener('keyup', e => {
+  const i = held.indexOf(KEYS[e.key]);
+  if (i >= 0) held.splice(i, 1);
+  if (e.key === 'Shift') trainer.speed = 1;
+});
+
+function steerTrainer() { // grid movement: one tile per step, turn toward the newest held key
+  if (trainer.path.length || lift || !held.length) return;
+  const d = held[held.length - 1], [x, y] = tileOf(trainer), [nx, ny] = [x + DELTA[d][0], y + DELTA[d][1]];
+  trainer.dir = d;
+  if (walkable(levelOf(floor), nx, ny) && !monAt(nx, ny)) trainer.path = [[nx, ny]];
+}
+function talk() {
+  const [x, y] = tileOf(trainer), m = monAt(x + DELTA[trainer.dir][0], y + DELTA[trainer.dir][1]);
+  if (!m) return;
+  const line = m.status === 'SLP' ? 'Zzz… 쿨쿨…' : m.status === 'PAR' ? '트레이너님, 여쭤볼 게 있어요!' : m.doing ? `지금 ${m.doing} 하는 중이에요!` : '…!';
+  say(m, `${m.name}: ${line}`, { force: true });
+}
+
+// You sent a message: walk over to that session's pokémon (taking the elevator if needed) and tell it.
+function visit(m, msg) {
+  trainer.visit = { key: m.key, msg, started: false };
+  if (m.floor !== floor) startLift(m.floor);
+}
+function tickVisit() {
+  const v = trainer.visit, m = v && mons.get(v.key);
+  if (!v || lift) return;
+  if (!m || m.floor !== floor) { trainer.visit = null; return; }
+  const goal = m.goal || tileOf(m);
+  if (!v.started) {
+    v.started = true;
+    const L = levelOf(floor);
+    trainer.path = bfs(L, tileOf(trainer), (x, y) => standable(L, x, y) && Math.abs(x - goal[0]) + Math.abs(y - goal[1]) === 1).slice(1);
+  } else if (!trainer.path.length) {
+    const [x, y] = tileOf(trainer), dx = goal[0] - x, dy = goal[1] - y;
+    trainer.dir = Math.abs(dx) > Math.abs(dy) ? (dx > 0 ? 'right' : 'left') : (dy > 0 ? 'down' : 'up');
+    say(m, `트레이너: "${v.msg}"`, { force: true });
+    trainer.visit = null;
+  }
+}
+function drawTrainer(t) {
+  const walk = { down: [3, 0, 4, 0], up: [5, 1, 6, 1], left: [7, 2, 8, 2], right: [7, 2, 8, 2] }[trainer.dir];
+  const n = trainer.path.length ? walk[Math.floor(t / (133 / trainer.speed)) % 4] : walk[1];
+  ctx.drawImage((trainer.dir === 'right' ? UI.redEast : UI.red)[n], Math.round(trainer.x) - 8, Math.round(trainer.y) - 31);
+}
+
+let last = 0;
+function frame(t) {
+  const dt = Math.min(50, t - last); last = t;
+  for (const m of [...mons.values()]) {
+    if (t < m.appearAt) continue;
+    step(m, dt);
+    if (m.leaving && !m.path.length) mons.delete(m.key); // stepped into the elevator
+  }
+  tickReports(t);
+  tickVisit();
+  steerTrainer();
+  step(trainer, dt);
+
+  const L = levelOf(floor);
+  ctx.save();
+  ctx.translate(GUIDE_W, 0);
+  ctx.fillStyle = '#000'; ctx.fillRect(0, 0, W, H);
+  ctx.save();
+  ctx.translate(L.ox, L.oy);
+  ctx.drawImage(L.below, 0, 0);
+  drawRooms(L, t);
+  const here = onFloor(floor).concat([...mons.values()].filter(m => m.leaving && m.floor === floor)).filter(m => t >= m.appearAt);
+  for (const m of [...here, trainer].sort((a, b) => a.y - b.y)) m === trainer ? drawTrainer(t) : drawMon(m, t);
+  ctx.drawImage(L.above, 0, 0);
+  drawRoomNames(L);
+  bubbleRects = [];
+  for (const m of here.sort((a, b) => b.y - a.y)) drawOverlay(m, t);
+  ctx.restore();
+  tickBox(t);
+  drawBox(t);
+  drawLift(t);
+  ctx.restore();
+
+  drawGuide(t);
+  ctx.save();
+  ctx.translate(GUIDE_W + W, 0);
+  drawParty(t);
+  ctx.restore();
+  ctx.save();
+  ctx.translate(0, H);
+  drawLog();
+  ctx.restore();
+  requestAnimationFrame(frame);
+}
+
+(async () => {
+  ctx.fillStyle = '#000'; ctx.fillRect(0, 0, CW, cv.height);
+  try {
+    await Promise.all([loadWorld(), loadUI(), document.fonts.load(FONT), document.fonts.load(FONT_S)]);
+  } catch (e) {
+    ctx.fillStyle = '#fff'; ctx.font = '12px sans-serif';
+    ctx.fillText('pokefirered 데이터를 불러오지 못했다: ' + e.message, 8, 20);
+    return;
+  }
+  [trainer.x, trainer.y] = [LEVELS[0].front[0] * 16 + 8, LEVELS[0].front[1] * 16 + 15];
+  requestAnimationFrame(frame);
+  const es = new EventSource('/events');
+  es.onopen = () => { mons.clear(); floors.length = 0; activity.length = 0; }; // server replays its log on every (re)connect
+  es.onmessage = e => apply(JSON.parse(e.data));
+})();
+</script>
+</body>
+</html>
