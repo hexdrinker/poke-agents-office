@@ -23,7 +23,21 @@
   .msg { margin: .7cqw 0; }
   .msg .who { font-size: .75cqw; color: #6c6c94; }
   .msg.user .who, .msg.task .who { color: #208040; }
-  .msg .text { white-space: pre-wrap; word-break: break-word; }
+  .msg .text { word-break: break-word; }
+  .text p, .text table, .text blockquote { margin: .4cqw 0; }
+  .text h4 { margin: .8cqw 0 .3cqw; font-size: 1cqw; color: #404040; }
+  .text > :first-child { margin-top: 0; }
+  .text > :last-child { margin-bottom: 0; }
+  .text b { color: #404040; }
+  .text .list-item { display: flex; gap: .4cqw; padding-left: calc(var(--depth) * 1.2cqw); }
+  .text .list-item > span { flex: none; color: #8080a0; }
+  .text code { background: #eeeee6; padding: 0 .25cqw; border-radius: .25cqw; font: .78cqw ui-monospace, monospace; text-shadow: none; }
+  .text a { color: #3050c0; }
+  .text table { display: block; overflow-x: auto; border-collapse: collapse; font-size: .8cqw; }
+  .text th, .text td { border: .1cqw solid #c8c8e0; padding: .15cqw .4cqw; text-align: left; vertical-align: top; }
+  .text th { background: #e8e8f0; color: #404040; }
+  .text blockquote { padding-left: .6cqw; border-left: .25cqw solid #c8c8e0; color: #808080; }
+  .text hr { border: 0; border-top: .15cqw solid #c8c8e0; margin: .6cqw 0; }
   .msg.user .text, .msg.task .text { background: #e8f4e0; padding: .3cqw .6cqw; border-radius: .5cqw; }
   .msg pre { white-space: pre-wrap; background: #eeeee6; padding: .4cqw .6cqw; border-radius: .4cqw; font: .72cqw/1.5 ui-monospace, monospace; text-shadow: none; }
   details.tools { margin: .5cqw 0; font-size: .78cqw; }
@@ -1011,7 +1025,78 @@ chatEl.style.width = `${(PARTY_W + 224) / CW * 100}%`;
 chatEl.style.height = `${H / cv.height * 100}%`;
 let chatOf = null, chatMon = null, chatTimer = null;
 const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]);
-const fmt = s => esc(s).split('```').map((part, i) => (i % 2 ? `<pre>${part.replace(/^[\w-]*\n/, '')}</pre>` : part)).join('');
+const fmt = s => esc(s).split('```').map((part, i) => (i % 2 ? `<pre>${part.replace(/^[\w-]*\n/, '')}</pre>` : markdown(part))).join('');
+const inlineMarkdown = text => text.split(/(`[^`]+`)/).map((part, index) => (index % 2
+  ? `<code>${part.slice(1, -1)}</code>`
+  : part
+    .replace(/\*\*(.+?)\*\*/g, '<b>$1</b>')
+    .replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>'))).join('');
+const tableCells = line => line.trim().replace(/^\||\|$/g, '').split('|').map(cell => inlineMarkdown(cell.trim()));
+const isTableDivider = line => /^[\s|:-]+$/.test(line ?? '') && line.includes('-') && line.includes('|');
+function markdown(text) {
+  const lines = text.split('\n'), html = [], indents = [];
+  let paragraph = [];
+  const flushParagraph = () => {
+    if (paragraph.length) {
+      html.push(`<p>${paragraph.map(inlineMarkdown).join('<br>')}</p>`);
+    }
+    paragraph = [];
+  };
+  for (let index = 0; index < lines.length; index++) {
+    const line = lines[index];
+    if (!line.trim()) {
+      flushParagraph();
+      continue;
+    }
+    if (/^\s*([-*_])(\s*\1){2,}\s*$/.test(line)) {
+      flushParagraph();
+      html.push('<hr>');
+      continue;
+    }
+    const listItem = line.match(/^(\s*)([-*+]|\d+[.)])\s+(.*)/);
+    if (listItem) {
+      flushParagraph();
+      const indent = listItem[1].length;
+      while (indents.length && indents.at(-1) > indent) {
+        indents.pop();
+      }
+      if (indents.at(-1) !== indent) {
+        indents.push(indent);
+      }
+      const bullet = /\d/.test(listItem[2]) ? listItem[2] : '•';
+      html.push(`<div class="list-item" style="--depth:${indents.length - 1}"><span>${bullet}</span><div>${inlineMarkdown(listItem[3])}</div></div>`);
+      continue;
+    }
+    indents.length = 0;
+    const heading = line.match(/^#{1,6}\s+(.*)/);
+    if (heading) {
+      flushParagraph();
+      html.push(`<h4>${inlineMarkdown(heading[1])}</h4>`);
+      continue;
+    }
+    if (line.includes('|') && isTableDivider(lines[index + 1])) {
+      flushParagraph();
+      let end = index + 2;
+      while (end < lines.length && lines[end].includes('|') && lines[end].trim()) {
+        end++;
+      }
+      const header = tableCells(line).map(cell => `<th>${cell}</th>`).join('');
+      const rows = lines.slice(index + 2, end).map(row => `<tr>${tableCells(row).map(cell => `<td>${cell}</td>`).join('')}</tr>`).join('');
+      html.push(`<table><tr>${header}</tr>${rows}</table>`);
+      index = end - 1;
+      continue;
+    }
+    const quote = line.match(/^&gt;\s?(.*)/);
+    if (quote) {
+      flushParagraph();
+      html.push(`<blockquote>${inlineMarkdown(quote[1])}</blockquote>`);
+      continue;
+    }
+    paragraph.push(line);
+  }
+  flushParagraph();
+  return html.join('');
+}
 const hhmm = t => (t ? new Date(t).toTimeString().slice(0, 5) : '');
 
 function openChat(m) {
