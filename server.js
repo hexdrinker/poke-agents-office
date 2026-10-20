@@ -8,7 +8,8 @@ const path = require('path');
 
 const PORT = Number(process.env.PORT) || 7777;
 const ROOT = process.env.CLAUDE_DIR || path.join(os.homedir(), '.claude');
-const POLL_MS = 250;
+const POLL_MS = 250;   // tail transcripts this often: Claude Code appends a line per finished message
+const SCAN_EVERY = 4;  // ...and look for started/ended sessions every 4th tick (1s)
 const HISTORY = 30; // events replayed from a transcript that was already running when we started
 const HOSTS = new Set([`127.0.0.1:${PORT}`, `localhost:${PORT}`]);
 
@@ -93,6 +94,7 @@ function track(file, seat, sub, fromEnd) {
 function readNew(file, f) {
   let buf;
   try {
+    if (fs.statSync(file).size === f.offset) return []; // nothing new: skip opening the file
     const fd = fs.openSync(file, 'r'), size = fs.fstatSync(fd).size;
     if (size < f.offset) f.offset = 0; // rewritten
     buf = Buffer.alloc(size - f.offset);
@@ -110,14 +112,22 @@ function readNew(file, f) {
   return out;
 }
 
+const transcripts = new Map(); // sessionId -> transcript path, so we search the project folders once
 function findTranscript(sessionId) {
+  if (transcripts.has(sessionId)) return transcripts.get(sessionId);
   for (const p of ls(path.join(ROOT, 'projects'))) {
     const file = path.join(ROOT, 'projects', p, sessionId + '.jsonl');
-    if (fs.existsSync(file)) return file;
+    if (fs.existsSync(file)) { transcripts.set(sessionId, file); return file; }
   }
 }
 
+let tick = 0;
 function poll() {
+  if (tick++ % SCAN_EVERY === 0) scan();
+  for (const [file, f] of files) readNew(file, f).forEach(emit);
+}
+
+function scan() {
   const now = new Map();
   for (const name of ls(path.join(ROOT, 'sessions'))) {
     if (!name.endsWith('.json')) continue;
@@ -145,12 +155,10 @@ function poll() {
   seats.clear();
   for (const [seat, s] of now) seats.set(seat, s);
 
-  for (const [file, f] of files) {
-    if (!now.has(f.seat)) { files.delete(file); continue; }
-    readNew(file, f).forEach(emit);
-  }
+  for (const [file, f] of files) if (!now.has(f.seat)) files.delete(file);
   firstPoll = false;
 }
+
 
 async function cached(rel, source) {
   const file = path.join(CACHE, rel);
