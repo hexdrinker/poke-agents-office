@@ -4,8 +4,9 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Poke Agents Office</title>
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/galmuri@2.40.3/dist/galmuri.css">
 <style>
+  @font-face { font-family: 'Galmuri11'; src: url('/vendor/fonts/Galmuri11.woff2') format('woff2'); }
+  @font-face { font-family: 'Galmuri9'; src: url('/vendor/fonts/Galmuri9.woff2') format('woff2'); }
   html, body { margin: 0; min-height: 100%; background: #000; }
   canvas { display: block; margin: 16px auto; image-rendering: pixelated; }
 </style>
@@ -14,7 +15,7 @@
 <canvas id="screen"></canvas>
 <script>
 // Everything is drawn at GBA resolution from the pret/pokefirered decomp data, then scaled up.
-const PRET = 'https://raw.githubusercontent.com/pret/pokefirered/master/';
+const PRET = '/pret/'; // proxied and cached by server.js
 const W = 36 * 16, H = 22 * 16; // map area: the largest Silph Co floor; smaller floors sit centered in it
 const GUIDE_W = 96, PARTY_W = 160, CW = GUIDE_W + W + PARTY_W; // floor directory | map | party, side by side
 const LOG_H = 136; // activity log strip under all three
@@ -365,7 +366,7 @@ const josa = (w, a, b) => { const c = w.charCodeAt(w.length - 1) - 0xac00; retur
 const ro = w => { const c = (w.charCodeAt(w.length - 1) - 0xac00) % 28; return c > 0 && c !== 8 ? '으로' : '로'; }; // ㄹ takes 로
 
 // PMD SpriteCollab walk/idle/sleep sheets: 8 direction rows, durations in 1/60s
-const PMD = 'https://raw.githubusercontent.com/PMDCollab/SpriteCollab/master/sprite/';
+const PMD = '/pmd/';
 const DIR = { down: 0, right: 2, up: 4, left: 6 };
 const sheets = {}, icons = {};
 function sheet(dex) {

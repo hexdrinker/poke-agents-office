@@ -12,6 +12,15 @@ const POLL_MS = 250;
 const HISTORY = 30; // events replayed from a transcript that was already running when we started
 const HOSTS = new Set([`127.0.0.1:${PORT}`, `localhost:${PORT}`]);
 
+// Game graphics are never committed: fetched once from their source repos, then served from .cache/.
+const UPSTREAM = {
+  '/pret/': 'https://raw.githubusercontent.com/pret/pokefirered/master/',
+  '/pmd/': 'https://raw.githubusercontent.com/PMDCollab/SpriteCollab/master/sprite/',
+};
+const CACHE = path.join(__dirname, '.cache');
+const TYPES = { '.png': 'image/png', '.woff2': 'font/woff2', '.xml': 'text/xml', '.txt': 'text/plain' };
+const inflight = new Map();
+
 const clients = new Set();
 const log = []; // ponytail: in-memory replay buffer, lost on restart
 const seats = new Map(); // pid -> { sessionId, cwd }; one pokémon per Claude process, so /clear keeps it
@@ -143,6 +152,21 @@ function poll() {
   firstPoll = false;
 }
 
+async function cached(rel, source) {
+  const file = path.join(CACHE, rel);
+  try { return await fs.promises.readFile(file); } catch {}
+  if (!inflight.has(file)) // several tiles ask for the same tileset at once: download it once
+    inflight.set(file, (async () => {
+      const r = await fetch(source);
+      if (!r.ok) throw Object.assign(new Error(source), { status: r.status === 404 ? 404 : 502 });
+      const buf = Buffer.from(await r.arrayBuffer());
+      await fs.promises.mkdir(path.dirname(file), { recursive: true });
+      await fs.promises.writeFile(file, buf);
+      return buf;
+    })().finally(() => inflight.delete(file)));
+  return inflight.get(file);
+}
+
 setInterval(poll, POLL_MS);
 poll();
 
@@ -156,6 +180,18 @@ http.createServer((req, res) => {
     for (const ev of log) res.write(`data: ${JSON.stringify(ev)}\n\n`);
     clients.add(res);
     req.on('close', () => clients.delete(res));
+    return;
+  }
+
+  const prefix = Object.keys(UPSTREAM).find(p => url.startsWith(p));
+  if (prefix || url.startsWith('/vendor/')) {
+    const rel = decodeURIComponent(url.slice(1));
+    if (!/^[\w./-]+$/.test(rel) || rel.split('/').includes('..')) { res.statusCode = 400; return res.end(); }
+    res.setHeader('Content-Type', TYPES[path.extname(rel)] || 'application/octet-stream');
+    if (!prefix) return fs.createReadStream(path.join(__dirname, rel)).on('error', () => { res.statusCode = 404; res.end(); }).pipe(res);
+    cached(rel, UPSTREAM[prefix] + rel.slice(prefix.length - 1))
+      .then(buf => res.end(buf))
+      .catch(e => { res.statusCode = e.status || 502; res.end(); });
     return;
   }
 
