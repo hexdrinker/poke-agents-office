@@ -645,15 +645,16 @@ function bubble(m, text, kind = 'talk', ms = 3000, force = false) {
 }
 
 // ---- activity log: when, which floor, who, where, what ----
-const activity = [];
+const activityByFloor = [];
 let evT = Date.now(); // time of the event being handled
 const whereOf = m => ZONE_NAMES[m.zone] || '내 자리';
 let logScroll = 0, logUnread = 0; // lines scrolled up from the newest; 0 = follow new entries
 function logAct(m, where, what, kind = '') {
-  activity.push({ t: evT, floor: m.floor, who: m.name, key: m.key, where, what, kind });
-  activity.sort((a, b) => a.t - b.t); // transcripts replay one after another, so keep it in time order
-  if (activity.length > 2000) activity.shift();
-  if (logScroll > 0) { logScroll++; logUnread++; } // reading older lines: keep the view still
+  const floorActivity = activityByFloor[m.floor] ??= [];
+  floorActivity.push({ t: evT, who: m.name, key: m.key, where, what, kind });
+  floorActivity.sort((a, b) => a.t - b.t); // transcripts replay one after another, so keep it in time order
+  if (floorActivity.length > 2000) floorActivity.shift();
+  if (logScroll > 0 && m.floor === floor) { logScroll++; logUnread++; } // reading older lines: keep the view still
 }
 
 function apply(ev) {
@@ -943,23 +944,23 @@ const LOG_ROWS = Math.floor((LOG_H - 30) / 13);
 function drawLog() {
   frameWindow(ctx, 0, 0, CW / 8, LOG_H / 8);
   text(ctx, '활동 로그', 10, 6, FONT_S);
-  for (const [label, x] of [['층', 64], ['누가', 86], ['어디서', 150], ['무엇을', 222]]) text(ctx, label, x, 6, FONT_S, [150, 150, 150]);
-  logScroll = Math.max(0, Math.min(logScroll, activity.length - LOG_ROWS));
+  for (const [label, x] of [['누가', 64], ['어디서', 128], ['무엇을', 200]]) text(ctx, label, x, 6, FONT_S, [150, 150, 150]);
+  const floorActivity = activityByFloor[floor] ?? [];
+  logScroll = Math.max(0, Math.min(logScroll, floorActivity.length - LOG_ROWS));
   if (!logScroll) logUnread = 0;
-  const start = Math.max(0, activity.length - LOG_ROWS - logScroll);
+  const start = Math.max(0, floorActivity.length - LOG_ROWS - logScroll);
   logRows = [];
-  activity.slice(start, start + LOG_ROWS).forEach((a, i) => { // oldest on top, newest at the bottom
+  floorActivity.slice(start, start + LOG_ROWS).forEach((a, i) => { // oldest on top, newest at the bottom
     const y = 21 + i * 13;
     logRows.push({ y: H + y, key: a.key });
     text(ctx, new Date(a.t).toTimeString().slice(0, 8), 10, y, FONT_S);
-    text(ctx, `${a.floor + 1}F`, 64, y, FONT_S);
-    text(ctx, fit(a.who, 60, FONT_S), 86, y, FONT_S);
-    text(ctx, fit(a.where, 68, FONT_S), 150, y, FONT_S, [40, 96, 160]);
-    text(ctx, fit(a.what, CW - 246, FONT_S), 222, y, FONT_S, LOG_COLORS[a.kind] || TEXT.fg);
+    text(ctx, fit(a.who, 60, FONT_S), 64, y, FONT_S);
+    text(ctx, fit(a.where, 68, FONT_S), 128, y, FONT_S, [40, 96, 160]);
+    text(ctx, fit(a.what, CW - 224, FONT_S), 200, y, FONT_S, LOG_COLORS[a.kind] || TEXT.fg);
   });
-  if (activity.length > LOG_ROWS) { // scrollbar
-    const trackY = 20, trackH = LOG_ROWS * 13, thumbH = Math.max(8, trackH * LOG_ROWS / activity.length);
-    const thumbY = trackY + (trackH - thumbH) * start / (activity.length - LOG_ROWS);
+  if (floorActivity.length > LOG_ROWS) { // scrollbar
+    const trackY = 20, trackH = LOG_ROWS * 13, thumbH = Math.max(8, trackH * LOG_ROWS / floorActivity.length);
+    const thumbY = trackY + (trackH - thumbH) * start / (floorActivity.length - LOG_ROWS);
     ctx.fillStyle = 'rgb(213,213,205)'; ctx.fillRect(CW - 14, trackY, 3, trackH);
     ctx.fillStyle = 'rgb(98,98,98)'; ctx.fillRect(CW - 14, Math.round(thumbY), 3, Math.round(thumbH));
   }
@@ -1154,6 +1155,8 @@ function drawLift(t) {
   const e = t - lift.t;
   if (e > 500 && floor !== lift.to) { // the trainer rides along and steps out of the elevator
     floor = lift.to;
+    logScroll = 0;
+    closeChat();
     const [fx, fy] = levelOf(floor).front;
     Object.assign(trainer, { x: fx * 16 + 8, y: fy * 16 + 15, path: [], dir: 'down' });
     if (trainer.visit) trainer.visit.started = false;
@@ -1293,7 +1296,7 @@ function frame(t) {
   [trainer.x, trainer.y] = [LEVELS[0].front[0] * 16 + 8, LEVELS[0].front[1] * 16 + 15];
   requestAnimationFrame(frame);
   const es = new EventSource('/events');
-  es.onopen = () => { mons.clear(); floors.length = 0; activity.length = 0; }; // server replays its log on every (re)connect
+  es.onopen = () => { mons.clear(); floors.length = 0; activityByFloor.length = 0; }; // server replays its log on every (re)connect
   es.onmessage = e => { const ev = JSON.parse(e.data); apply(ev); refreshChat(ev); };
 })();
 </script>
